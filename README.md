@@ -1,154 +1,72 @@
-# Non-Steam Sync for Playnite
+# Playnite Steam Sync
 
-[![Version](https://img.shields.io/badge/version-0.7.0-blue.svg)](https://github.com/hikaps/non-steam-sync/releases)
-[![License](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
-[![Playnite](https://img.shields.io/badge/Playnite-9+-orange.svg)](https://playnite.link)
-[![CI](https://github.com/hikaps/non-steam-sync/actions/workflows/build.yml/badge.svg)](https://github.com/hikaps/non-steam-sync/actions/workflows/build.yml)
+Playnite Steam Sync is a community Playnite extension for syncing eligible games and artwork from your Playnite library to Steam non-Steam shortcuts. Keep Playnite as your game library, then launch supported PC, storefront, and emulator games from Steam Big Picture with Steam overlay and Steam Input support.
 
+This is an independent development fork of [hikaps/non-steam-sync](https://github.com/hikaps/non-steam-sync). It is not affiliated with or endorsed by Playnite or Valve.
 
-## Why This Exists
+## Automatic Playnite to Steam sync
 
-I love Playnite as a clean, flexible launcher, but Steam offers the best controller experience: powerful per-game profiles, community layouts, Steam Input, and the overlay. This extension bridges the two so you can start games from Playnite while actually launching them through Steam—getting Playnite's organization and visuals with Steam's controller magic. It's the best of both worlds with minimal fuss.
+The extension starts with one filtered export. After that baseline, it uses Playnite library events and a persistent background queue to add eligible new games and refresh artwork for games it already tracks. A clean Playnite launch does not trigger a full library scan.
+
+You can filter by Playnite source, installed state, emulator actions, and URL actions. The initial export and later reconciliation show which games qualify before changing Steam shortcuts.
 
 ## Features
 
-- **Two-way sync** between Steam shortcuts and Playnite
-- **Artwork support** — covers, icons, and backgrounds sync between Playnite and Steam; logos are exported to Steam
-- **Launch via Steam** — use `steam://rungameid/...` URLs for full controller and overlay support
-- **Automatic write-back** — edits in Playnite sync back to Steam (name, artwork, play actions)
-- **Backup & restore** — automatic backups before changes, with easy restore from settings
-- **Multi-user support** — works with multiple Steam profiles on the same machine
+- **Automatic game sync:** new eligible Playnite games are queued after the initial filtered export.
+- **Automatic artwork sync:** covers, posters, icons, logos, and backgrounds are checked when Playnite updates a tracked game.
+- **Idempotent background queue:** snapshots are coalesced, sequenced, persisted, retried, and recovered after a Playnite restart.
+- **Steam shortcut safety:** artwork is staged and verified by SHA-256; existing files are backed up before atomic replacement.
+- **Safe shortcuts.vdf updates:** the extension validates the VDF and waits for Steam to close before changing shortcut fields.
+- **Big Picture launch support:** supported shortcuts launch through Steam; Steam Input layouts and emulator controller mappings remain user-managed.
+- **Conservative failure handling:** ambiguous launch actions go to NeedsAttention; the automatic worker does not open dialogs or choose a generic launcher.
 
-## Installation
+Removing a game from Playnite does not automatically remove its Steam shortcut. The extension does not install games, transfer purchases, or configure controller mappings.
 
-### From Playnite (Recommended)
+## How synchronization works
 
-1. In Playnite, open **Add-ons** (press `F9` or click the gamepad menu ☰ → **Add-ons**)
-2. Go to **Browse → Libraries** and search for "Non-Steam Sync"
-3. Click **Install** and restart when prompted
+1. Choose Steam profile, Playnite sources, and eligibility filters.
+2. Run the initial export and confirm the filtered game count. A successful export establishes the baseline.
+3. Enable automatic Playnite-to-Steam sync.
+4. Playnite AddedItems events queue new eligible games. ItemUpdated events refresh tracked game data and artwork.
+5. A serial worker processes the durable queue. Repeated identical snapshots do not produce repeated writes.
 
-### Manual Installation
+Artwork files can be copied while Steam is open. If a shortcut field in shortcuts.vdf must change, that write waits until Steam exits normally. The extension does not force-close Steam.
 
-1. Download the latest `.pext` from [Releases](https://github.com/hikaps/non-steam-sync/releases)
-2. In Playnite: **Add-ons → Install from file…** → select the `.pext`
-3. Restart Playnite when prompted
+## Validation status
 
-## Requirements
+The public `main` branch contains the idempotent event-sync implementation. It has passed 318 automated tests and a Release build. Live validation used Playnite 10.63 and a Steam installation:
 
-- Windows 10/11
-- Playnite 9 or later
-- Steam installed
-- .NET Framework 4.6.2+ (included with Windows 10+)
+- 48 filtered shortcuts were present after the initial export.
+- All 240 artwork targets for those shortcuts matched their Playnite source files by SHA-256.
+- The 48 VDF icon paths pointed to the prepared Steam grid files; executable paths, working directories, and launch arguments matched the pre-artwork snapshot.
+- A controlled Playnite LibraryPlugin test exercised the real import event and asynchronous worker, then launched a harmless test shortcut through Steam Big Picture.
 
-## Setup
+The live test has not yet covered a new game imported by a commercial storefront connector, extended background stability, a Windows reboot, or a prolonged visual review in Big Picture. See the [validation report](docs/VALIDATION_REPORT.md).
 
-1. Open settings: **Add-ons → Extension Settings → Non-Steam Sync**
-2. Set your Steam folder:
-   - The path is **auto-detected** from the Windows registry on first run
-   - Use **Browse** to pick a folder manually
-   - Use **Auto-detect** to re-run registry detection
-3. Path validation shows the current status:
-   - ✓ **Valid** — Steam folder found with userdata
-   - ⚠ **Warning** — folder exists but no userdata found
-   - ✗ **Invalid** — folder doesn't exist
-4. Optional: Enable **"Launch via Steam"** to use Steam URLs as the default play action
+## Build and test
 
-## Usage
+Run these commands from the repository root:
 
-### Importing from Steam → Playnite
+- dotnet test tests/ShortcutsTests/ShortcutsTests.csproj
+- dotnet build src/SteamShortcutsImporter/SteamShortcutsImporter.csproj --configuration Release
 
-1. **Main menu → Steam Shortcuts → "Sync Steam → Playnite…"**
-2. Preview covers/icons, filter by text, toggle "Only new"
-3. Select the shortcuts you want to import
-4. Click **Import** — artwork is pulled from Steam's grid folder automatically
+Creating a .pext package also requires the compatible Playnite Toolbox. Run tools/pack.ps1 -Configuration Release.
 
-### Exporting from Playnite → Steam
+## Development and distribution status
 
-1. **Main menu → Steam Shortcuts → "Sync Playnite → Steam…"**
-2. Select games with a file-based play action
-3. Click **Export** — games are added/updated in `shortcuts.vdf`
-4. Covers, icons, backgrounds, and a logo (reusing the icon) are copied to Steam's grid folder
+The public GitHub fork is linked to its upstream, and its `main` branch contains the incremental event-sync implementation. No installer, `.pext` package, or release is available.
 
-### Automatic Write-back
+As of 2026-10-28, the upstream repository does not declare a license. GitHub permits viewing and forking through its service, but that does not establish a general license to redistribute a `.pext` package or release outside GitHub. See [development notes](docs/DEVELOPMENT.md).
 
-When enabled, editing a Steam Shortcuts game in Playnite (name, play action, tags, artwork) automatically updates `shortcuts.vdf` and Steam grid files. Changes are debounced to prevent race conditions.
+## Documentation
 
-### Backup & Restore
+- [User guide](docs/USER_GUIDE.md)
+- [Product specification](docs/PRODUCT_SPEC.md)
+- [Architecture](docs/ARCHITECTURE.md)
+- [Development and testing](docs/DEVELOPMENT.md)
+- [Validation report](docs/VALIDATION_REPORT.md)
+- [Roadmap](docs/ROADMAP.md)
 
-- **Automatic backups**: Before any write to `shortcuts.vdf`, a timestamped backup is created
-- **Restore**: In settings, click **"Restore Backup…"** to select a previous backup
-- Backups are stored per Steam user: `<plugin-data>/backups/<userId>/`
-- The last 5 backups per user are retained
+## Resumo em português
 
-### Context Menu Actions
-
-Right-click any game for quick actions:
-
-- **Add/Update in Steam** — export selected games to Steam shortcuts
-- **Copy Steam Launch URL** — copy the `steam://rungameid/...` URL to clipboard
-- **Open Steam Grid Folder** — open the artwork folder in Explorer
-
-## Troubleshooting
-
-### "No shortcuts found" or nothing imports
-
-- Check the Steam root path in settings
-- The plugin searches `userdata/<steamid>/config/shortcuts.vdf`
-- If you have multiple Steam profiles, ensure the intended one has shortcuts
-
-### Games skipped during export
-
-When exporting from Playnite to Steam, some games may be skipped. Common reasons:
-
-- **"No executable found"**: The plugin couldn't detect a game executable. This happens with games from some launchers (Epic, EA, Amazon) that don't expose their exe path to Playnite.
-- **"No install directory"**: The game has no install path set in Playnite.
-- **"Skipped by user"**: You chose to skip the game when prompted.
-
-**How the plugin finds executables:**
-
-1. Uses the game's existing File action (if set)
-2. Falls back to URL action (creates a double-launcher shortcut)
-3. For GOG games: parses the `goggame-*.info` manifest
-4. Scans the install directory for exe files (filters out common installers/redistributables)
-5. If auto-detection fails: prompts you to browse for the executable manually
-
-**To fix skipped games:**
-
-1. Try right-clicking the game in Playnite and adding a manual play action
-2. When prompted to browse, select the game's main executable
-3. The selection is saved so future exports will work automatically
-
-### "Launch via Steam" doesn't work
-
-- The game needs a known shortcut appid
-- New exports compute appids automatically using Steam's CRC32 algorithm
-- Try re-exporting the game to Steam
-
-### Artwork didn't copy
-
-- Grid files live under `userdata/<steamid>/config/grid/`
-- Ensure the folder exists and is writable
-- Supported formats: PNG, JPG, ICO
-
-### Changes not appearing in Steam
-
-- **Close Steam** before making changes — Steam caches `shortcuts.vdf` in memory
-- If Steam was running, restart it to see updates
-
-### Steam warns about running
-
-- The plugin detects if Steam is running and warns you
-- For best results, close Steam before syncing
-
-## How It Works
-
-- Uses a binary KeyValues reader/writer for Steam's `shortcuts.vdf` format
-- Shortcut appids are computed using CRC32 (matching Steam's algorithm)
-- The `rungameid` URL format: `steam://rungameid/<gameId>` where gameId encodes the appid
-- StableIds (hash of exe+name) ensure consistent matching across syncs
-
----
-
-## AI Disclosure
-
-This project was developed with assistance from AI tools for code generation, documentation, and debugging.
+Extensão comunitária do Playnite para sincronizar jogos elegíveis e capas, ícones e fundos com os atalhos não-Steam da biblioteca Steam. Após uma exportação inicial filtrada, uma fila assíncrona e idempotente processa novos jogos e atualizações de arte recebidas pelos eventos do Playnite. O projeto está em desenvolvimento; ainda não há instalador ou release público.

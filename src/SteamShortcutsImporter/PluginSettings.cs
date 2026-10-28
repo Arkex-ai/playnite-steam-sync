@@ -19,6 +19,13 @@ public class PluginSettings : ISettings
     public bool SteamActionIsDefault { get; set; } = true;
     public string? SelectedSteamUserId { get; set; } = null;
     public Dictionary<string, string> ExportMap { get; set; } = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+    public bool AutoSyncEnabled { get; set; }
+    public bool AutoSyncOnlyInstalled { get; set; } = true;
+    public bool AutoSyncIncludeEmulators { get; set; } = true;
+    public bool AutoSyncIncludeUrls { get; set; }
+    public List<string> AutoSyncSourceIds { get; set; } = new List<string>();
+    // Retained for one-time migration from development builds that stored provider PluginIds.
+    public List<string> AutoSyncPluginIds { get; set; } = new List<string>();
 
     public void BeginEdit() { _originalSteamActionIsDefault = SteamActionIsDefault; }
     public void CancelEdit() { }
@@ -27,6 +34,7 @@ public class PluginSettings : ISettings
         if (_plugin != null)
         {
             _plugin.SavePluginSettings(this);
+            ShortcutsLibrary.NotifySettingsSaved();
             if (SteamActionIsDefault != _originalSteamActionIsDefault)
             {
                 try
@@ -66,6 +74,12 @@ public class PluginSettings : ISettings
                 SteamActionIsDefault = saved.SteamActionIsDefault;
                 SelectedSteamUserId = saved.SelectedSteamUserId;
                 ExportMap = saved.ExportMap ?? new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+                AutoSyncEnabled = saved.AutoSyncEnabled;
+                AutoSyncOnlyInstalled = saved.AutoSyncOnlyInstalled;
+                AutoSyncIncludeEmulators = saved.AutoSyncIncludeEmulators;
+                AutoSyncIncludeUrls = saved.AutoSyncIncludeUrls;
+                AutoSyncSourceIds = saved.AutoSyncSourceIds ?? new List<string>();
+                AutoSyncPluginIds = saved.AutoSyncPluginIds ?? new List<string>();
             }
             else
             {
@@ -74,6 +88,12 @@ public class PluginSettings : ISettings
                 SteamActionIsDefault = true;
                 SelectedSteamUserId = null;
                 ExportMap = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+                AutoSyncEnabled = false;
+                AutoSyncOnlyInstalled = true;
+                AutoSyncIncludeEmulators = true;
+                AutoSyncIncludeUrls = false;
+                AutoSyncSourceIds = new List<string>();
+                AutoSyncPluginIds = new List<string>();
             }
         }
         catch (Exception ex)
@@ -84,6 +104,12 @@ public class PluginSettings : ISettings
             SteamActionIsDefault = true;
             SelectedSteamUserId = null;
             ExportMap = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+            AutoSyncEnabled = false;
+            AutoSyncOnlyInstalled = true;
+            AutoSyncIncludeEmulators = true;
+            AutoSyncIncludeUrls = false;
+            AutoSyncSourceIds = new List<string>();
+            AutoSyncPluginIds = new List<string>();
         }
     }
 

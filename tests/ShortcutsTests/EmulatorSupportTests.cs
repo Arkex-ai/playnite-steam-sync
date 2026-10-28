@@ -11,6 +11,34 @@ namespace SteamShortcutsImporter.Tests;
 public class EmulatorSupportTests
 {
     [Fact]
+    public void HasPlayableSelectionAction_ResolvableEmulatorActionWithoutDirectPath_IsIncluded()
+    {
+        var emulatorAction = CreateEmulatorAction(Guid.NewGuid(), "profile-1");
+
+        var result = ImportExportService.HasPlayableSelectionAction(
+            fileAction: null,
+            emulatorAction: emulatorAction,
+            emulatorResolved: true,
+            urlAction: null);
+
+        Assert.True(result);
+    }
+
+    [Fact]
+    public void HasPlayableSelectionAction_UnresolvedEmulatorWithoutFallback_IsExcluded()
+    {
+        var emulatorAction = CreateEmulatorAction(Guid.NewGuid(), "missing-profile");
+
+        var result = ImportExportService.HasPlayableSelectionAction(
+            fileAction: null,
+            emulatorAction: emulatorAction,
+            emulatorResolved: false,
+            urlAction: null);
+
+        Assert.False(result);
+    }
+
+    [Fact]
     public void BuildEmulatorActionResult_MissingEmulator_ReturnsNullAction()
     {
         var expand = CreateExpand();

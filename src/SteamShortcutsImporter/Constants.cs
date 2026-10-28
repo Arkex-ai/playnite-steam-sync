@@ -111,10 +111,8 @@ internal static class Constants
     // Selection dialog indicators
     public const string ExeNotSetIndicator = "(executable not set - will prompt)";
 
-    // Steam restart confirmation
-    public const string SteamRestartConfirmMessage = "Steam will be restarted to complete this operation.\n\n" +
-        "This ensures shortcuts are written safely without corruption.\n\n" +
-        "Do you want to continue?";
+    // Steam process state
+    public const string SteamMustBeClosedMessage = "Steam must be fully closed before shortcuts.vdf can be changed. Use Steam's Exit command, then retry. The add-on has not changed shortcuts.vdf.";
 
     // Steam user selection UI
     public const string SteamUserLabel = "Default Steam user:";

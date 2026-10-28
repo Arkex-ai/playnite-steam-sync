@@ -1,7 +1,7 @@
 <Project Sdk="Microsoft.NET.Sdk">
   <PropertyGroup>
     <OutputType>Exe</OutputType>
-    <TargetFramework>net6.0</TargetFramework>
+    <TargetFramework>net8.0</TargetFramework>
     <ImplicitUsings>enable</ImplicitUsings>
     <Nullable>enable</Nullable>
   </PropertyGroup>
@@ -9,6 +9,15 @@
   <ItemGroup>
     <Compile Include="..\..\src\SteamShortcutsImporter\ShortcutsFile.cs">
       <Link>ShortcutsFile.cs</Link>
+    </Compile>
+    <Compile Include="..\..\src\SteamShortcutsImporter\BinaryKv.cs">
+      <Link>BinaryKv.cs</Link>
+    </Compile>
+    <Compile Include="..\..\src\SteamShortcutsImporter\Constants.cs">
+      <Link>Constants.cs</Link>
+    </Compile>
+    <Compile Include="..\..\src\SteamShortcutsImporter\Utils.cs">
+      <Link>Utils.cs</Link>
     </Compile>
   </ItemGroup>
 </Project>

@@ -211,6 +211,52 @@ public class BinaryKvTests
     }
 
     [Fact]
+    public void RejectsDuplicateKeysInsideNestedObjects()
+    {
+        var ms = new MemoryStream();
+        ms.WriteByte(0x00); // Object
+        WriteCString(ms, "shortcuts");
+        ms.WriteByte(0x01); // String
+        WriteCString(ms, "0");
+        WriteCString(ms, "first entry");
+        ms.WriteByte(0x01); // String
+        WriteCString(ms, "0");
+        WriteCString(ms, "duplicate entry");
+        ms.WriteByte(0x08); // End nested object
+        ms.WriteByte(0x08); // End root object
+        ms.Position = 0;
+
+        Assert.Throws<InvalidDataException>(() => BinaryKv.ReadObject(ms));
+    }
+
+    [Fact]
+    public void RejectsCaseInsensitiveDuplicateKeys()
+    {
+        var ms = new MemoryStream();
+        ms.WriteByte(0x01); // String
+        WriteCString(ms, "AppName");
+        WriteCString(ms, "first");
+        ms.WriteByte(0x01); // String
+        WriteCString(ms, "appname");
+        WriteCString(ms, "second");
+        ms.WriteByte(0x08); // End root object
+        ms.Position = 0;
+
+        Assert.Throws<InvalidDataException>(() => BinaryKv.ReadObject(ms));
+    }
+
+    [Fact]
+    public void RejectsTrailingBytesAfterRootTerminator()
+    {
+        var ms = new MemoryStream();
+        BinaryKv.WriteObject(ms, new Dictionary<string, object>());
+        ms.WriteByte(0xFF);
+        ms.Position = 0;
+
+        Assert.Throws<InvalidDataException>(() => BinaryKv.ReadObject(ms));
+    }
+
+    [Fact]
     public void HandlesLargeNumberOfEntries()
     {
         // Create object with 100 entries

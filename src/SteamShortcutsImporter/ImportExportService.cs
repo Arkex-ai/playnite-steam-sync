@@ -169,7 +169,11 @@ internal class ImportExportService
         }
         try
         {
-            var allGames = _library.PlayniteApi.Database.Games.Where(g => !g.Hidden).ToList();
+            var allGames = _library.PlayniteApi.Database.Games
+                .Where(g => !g.Hidden && g.PluginId != _library.Id)
+                .Where(g => !AutoSyncHandler.IsSteamSource(g.Source?.Name ?? g.Source?.ToString()))
+                .ToList();
+            var isInitialBaseline = !_library.IsInitialAutoSyncBaselineComplete;
             var shortcuts = File.Exists(vdfPath) ? ShortcutsFile.Read(vdfPath!).ToList() : new List<SteamShortcut>();
             var existingShortcuts = new Dictionary<uint, SteamShortcut>();
             var existingByStable = new Dictionary<string, SteamShortcut>(StringComparer.OrdinalIgnoreCase);
@@ -203,7 +207,8 @@ internal class ImportExportService
                     return cached;
                 }
 
-                var computed = BuildSelectionCandidate(game, existingShortcuts, existingByStable, byPlayniteId);
+                var computed = BuildSelectionCandidate(
+                    game, existingShortcuts, existingByStable, byPlayniteId, allowExecutableDiscovery: isInitialBaseline);
                 if (game.Id != Guid.Empty)
                 {
                     detectionById[game.Id] = computed;
@@ -213,6 +218,55 @@ internal class ImportExportService
                     detectionByRef[game] = computed;
                 }
                 return computed;
+            }
+
+            if (isInitialBaseline)
+            {
+                var filteredGames = allGames
+                    .Where(game => AutoSyncHandler.IsEligibleForInitialFilteredExport(
+                        game,
+                        _library.Settings,
+                        _library.Id,
+                        _pathResolver,
+                        _library.PlayniteApi.Addons.Plugins,
+                        GameActionSelector.GetCurrentProcessExecutablePath(),
+                        Logger))
+                    .ToList();
+                var exportableGames = filteredGames
+                    .Where(game => GetCandidate(game).HasSupportedLaunchAction)
+                    .ToList();
+                if (exportableGames.Count == 0)
+                {
+                    _library.PlayniteApi.Dialogs.ShowMessage(
+                        "No games match the selected source and launch filters with a supported action. The initial baseline was not changed. Choose sources or adjust the filters, then try again.",
+                        Constants.ExportDialogTitle);
+                    return;
+                }
+
+                var unsupportedCount = filteredGames.Count - exportableGames.Count;
+                var prompt = $"This is the one-time filtered export that establishes the automatic-sync baseline. It will add or update {exportableGames.Count} game(s) in one Steam VDF write.";
+                if (unsupportedCount > 0)
+                {
+                    prompt += $" {unsupportedCount} matching game(s) have no supported, resolvable launch action and will be skipped.";
+                }
+                prompt += " Close Steam before continuing. Continue?";
+
+                var confirmation = _library.PlayniteApi.Dialogs.ShowMessage(
+                    prompt,
+                    Constants.ExportDialogTitle,
+                    System.Windows.MessageBoxButton.YesNo,
+                    System.Windows.MessageBoxImage.Question);
+                if (confirmation == System.Windows.MessageBoxResult.Yes)
+                {
+                    var result = AddGamesToSteamCore(exportableGames, establishInitialBaseline: true);
+                    if (result.Added > 0 || result.Updated > 0 || result.Skipped > 0)
+                    {
+                        _library.PlayniteApi.Dialogs.ShowMessage(
+                            $"Initial filtered export finished. Created: {result.Added}, updated: {result.Updated}, skipped: {result.Skipped}. The baseline is complete only if at least one shortcut was written successfully.",
+                            _library.Name);
+                    }
+                }
+                return;
             }
 
             _dialogBuilder.ShowSelectionDialog(
@@ -239,14 +293,12 @@ internal class ImportExportService
                 confirmLabel: Constants.ExportConfirmLabel,
                 onConfirm: selectedGames =>
                 {
-                    var res = AddGamesToSteamCore(selectedGames);
+                    var res = AddGamesToSteamCore(selectedGames, establishInitialBaseline: false);
                     
                     if (res.Added == 0 && res.Updated == 0 && res.Skipped == 0)
                     {
                         return;
                     }
-
-                    RestartSteamIfNeeded(res.WasSteamRunning);
 
                     var msg = $"Steam shortcuts updated. Created: {res.Added}, Updated: {res.Updated}, Skipped: {res.Skipped}.";
                     _library.PlayniteApi.Dialogs.ShowMessage(msg, _library.Name);
@@ -277,8 +329,6 @@ internal class ImportExportService
         {
             return;
         }
-
-        RestartSteamIfNeeded(res.WasSteamRunning);
 
         var msg = $"Added: {res.Added}, Updated: {res.Updated}";
         if (res.Skipped > 0)
@@ -325,7 +375,12 @@ internal class ImportExportService
         return byPlayniteId;
     }
 
-    private SelectionCandidate BuildSelectionCandidate(Game game, Dictionary<uint, SteamShortcut> existingById, Dictionary<string, SteamShortcut> existingByStable, Dictionary<string, uint> byPlayniteId)
+    private SelectionCandidate BuildSelectionCandidate(
+        Game game,
+        Dictionary<uint, SteamShortcut> existingById,
+        Dictionary<string, SteamShortcut> existingByStable,
+        Dictionary<string, uint> byPlayniteId,
+        bool allowExecutableDiscovery = false)
     {
         if (game == null)
         {
@@ -336,8 +391,24 @@ internal class ImportExportService
         {
             var actions = game.GameActions?.Where(a => a != null).ToList() ?? new List<GameAction>();
             var primaryAction = actions.FirstOrDefault(a => a.IsPlayAction) ?? actions.FirstOrDefault();
-            var fileAction = actions.FirstOrDefault(a => a.Type == GameActionType.File && !string.IsNullOrEmpty(a.Path));
-            var hasAction = actions.Any(a => !string.IsNullOrEmpty(a.Path));
+            var selectedAction = GameActionSelector.GetPreferredLaunchAction(actions);
+            if (selectedAction == null && allowExecutableDiscovery && !actions.Any(action => action.IsPlayAction))
+            {
+                selectedAction = GameActionSelector.TryCreateSingleDynamicPlayAction(
+                    game,
+                    _library.PlayniteApi.Addons.Plugins,
+                    GameActionSelector.GetCurrentProcessExecutablePath(),
+                    Logger);
+            }
+            if (selectedAction == null && allowExecutableDiscovery && !actions.Any(action => action.IsPlayAction))
+            {
+                selectedAction = GameActionSelector.DiscoverFileAction(game, _pathResolver);
+            }
+            var fileAction = selectedAction?.Type == GameActionType.File ? selectedAction : null;
+            var emulatorAction = selectedAction?.Type == GameActionType.Emulator ? selectedAction : null;
+            var resolvedEmulator = emulatorAction != null ? BuildEmulatorActionResult(game, emulatorAction) : default;
+            var resolvedEmulatorAction = resolvedEmulator.action;
+            var urlAction = selectedAction?.Type == GameActionType.URL ? selectedAction : null;
 
             string exePath = string.Empty;
             if (fileAction != null)
@@ -348,6 +419,12 @@ internal class ImportExportService
                     exePath = fileAction.Path ?? string.Empty;
                 }
             }
+            else if (resolvedEmulatorAction != null)
+            {
+                exePath = resolvedEmulator.exePath ?? resolvedEmulatorAction.Path ?? string.Empty;
+            }
+
+            var hasAction = HasPlayableSelectionAction(fileAction, emulatorAction, resolvedEmulatorAction != null, urlAction);
 
             string name = !string.IsNullOrEmpty(game.Name)
                 ? game.Name
@@ -362,22 +439,12 @@ internal class ImportExportService
                 exists = existingById.ContainsKey(mappedAppId);
             }
 
-            if (!exists && actions.Count > 0)
+            if (!exists && urlAction != null)
             {
-                foreach (var act in actions)
+                if (!string.IsNullOrEmpty(urlAction.Path))
                 {
-                    if (act?.Type == GameActionType.URL && !string.IsNullOrEmpty(act.Path))
-                    {
-                        var maybeAppId = SteamPathResolver.TryParseAppIdFromRungameUrl(act.Path);
-                        if (maybeAppId != 0)
-                        {
-                            exists = existingById.ContainsKey(maybeAppId);
-                            if (exists)
-                            {
-                                break;
-                            }
-                        }
-                    }
+                    var maybeAppId = SteamPathResolver.TryParseAppIdFromRungameUrl(urlAction.Path);
+                    if (maybeAppId != 0) exists = existingById.ContainsKey(maybeAppId);
                 }
             }
 
@@ -396,15 +463,15 @@ internal class ImportExportService
                 exists = existingById.ContainsKey(computed);
             }
 
-            var displayAction = primaryAction ?? fileAction;
+            var displayAction = fileAction ?? resolvedEmulatorAction ?? urlAction ?? primaryAction;
             var target = displayAction != null
                 ? (displayAction.Type == GameActionType.File
                     ? (string.IsNullOrEmpty(exePath) ? displayAction.Path ?? string.Empty : exePath)
                     : displayAction.Path ?? string.Empty)
                 : string.Empty;
 
-            // Check if this game needs exe discovery (no file action but might be exportable)
-            var needsExeDiscovery = fileAction == null && !string.IsNullOrEmpty(game.InstallDirectory);
+            // Only offer executable discovery when none of the supported actions resolved.
+            var needsExeDiscovery = !hasAction && !string.IsNullOrEmpty(game.InstallDirectory);
             
             // Build display label
             string label;
@@ -418,9 +485,7 @@ internal class ImportExportService
                 label = (name + " — " + target) + (exists ? Constants.SteamTag : string.Empty);
             }
             
-            // Games needing discovery are considered to have a potential action
-            var hasPlayableAction = hasAction || needsExeDiscovery;
-            return new SelectionCandidate(label, hasPlayableAction, exists);
+            return new SelectionCandidate(label, hasAction || needsExeDiscovery, exists, hasAction);
         }
         catch (Exception ex)
         {
@@ -429,86 +494,126 @@ internal class ImportExportService
         }
     }
 
-    private bool ConfirmSteamRestart()
+    internal static bool HasPlayableSelectionAction(
+        GameAction? fileAction,
+        GameAction? emulatorAction,
+        bool emulatorResolved,
+        GameAction? urlAction)
     {
-        var result = _library.PlayniteApi.Dialogs.ShowMessage(
-            Constants.SteamRestartConfirmMessage,
-            _library.Name,
-            System.Windows.MessageBoxButton.YesNo,
-            System.Windows.MessageBoxImage.Question
-        );
-        
-        return result == System.Windows.MessageBoxResult.Yes;
+        return (fileAction != null && !string.IsNullOrEmpty(fileAction.Path))
+            || (emulatorAction != null && emulatorResolved)
+            || (urlAction != null && !string.IsNullOrEmpty(urlAction.Path));
     }
 
-    private void RestartSteamIfNeeded(bool wasSteamRunning)
+    private ExportResult AddGamesToSteamCore(IEnumerable<Game> games, bool establishInitialBaseline = false)
     {
-        if (!wasSteamRunning)
+        var selectedGames = games?.Where(game => game != null).ToList() ?? new List<Game>();
+        if (selectedGames.Count == 0)
         {
-            return;
+            Logger.Info("No games were selected; shortcuts.vdf and the initial baseline were left unchanged.");
+            return new ExportResult();
         }
 
-        Logger.Info("Restarting Steam after export...");
-        SteamProcessHelper.TryLaunchSteam(_library.Settings.SteamRootPath);
-    }
-
-    private ExportResult AddGamesToSteamCore(IEnumerable<Game> games)
-    {
         var vdfPath = _pathResolver.ResolveShortcutsVdfPathForUser(_library.Settings.SelectedSteamUserId);
         if (string.IsNullOrWhiteSpace(vdfPath))
         {
             return new ExportResult();
         }
 
-        if (!ConfirmSteamRestart())
+        if (!SteamProcessHelper.TryIsSteamRunning(out var steamRunning))
         {
+            _library.PlayniteApi.Dialogs.ShowErrorMessage("Steam process state could not be checked, so shortcuts.vdf was left unchanged.", _library.Name);
             return new ExportResult();
         }
 
-        var wasSteamRunning = SteamProcessHelper.IsSteamRunning();
-        if (wasSteamRunning)
+        if (steamRunning)
         {
-            Logger.Info("Closing Steam before export...");
-            SteamProcessHelper.TryCloseSteam();
+            _library.PlayniteApi.Dialogs.ShowMessage(Constants.SteamMustBeClosedMessage, _library.Name);
+            return new ExportResult();
         }
-
-        var shortcuts = File.Exists(vdfPath) ? ShortcutsFile.Read(vdfPath!).ToList() : new List<SteamShortcut>();
-        var existing = shortcuts.ToDictionary(s => s.AppId, s => s);
-        var byPlayniteId = BuildPlayniteIdLookup();
-
-        var context = new ExportContext { SkipAllRemaining = false };
 
         int added = 0, updated = 0, skipped = 0;
         var skippedGames = new List<string>();
-
-        foreach (var g in games)
+        var exported = new List<ShortcutsLibrary.ExportedShortcut>();
+        try
         {
-            var (exePath, workDir, name, action, result) = GetGameActionDetailsWithFallback(g, existing, byPlayniteId, context);
-            
-            if (result == ExeDiscoveryResult.UserSkippedAll)
+            var sourceFingerprint = ShortcutsFile.GetFileFingerprint(vdfPath!);
+            var shortcuts = File.Exists(vdfPath) ? ShortcutsFile.Read(vdfPath!).ToList() : new List<SteamShortcut>();
+            var existing = shortcuts.GroupBy(s => s.AppId).ToDictionary(group => group.Key, group => group.First());
+            var existingByStable = shortcuts
+                .Where(shortcut => !string.IsNullOrWhiteSpace(shortcut.StableId))
+                .GroupBy(shortcut => shortcut.StableId, StringComparer.OrdinalIgnoreCase)
+                .ToDictionary(group => group.Key, group => group.ToList(), StringComparer.OrdinalIgnoreCase);
+            var byPlayniteId = BuildPlayniteIdLookup();
+            var batchAppIdOwners = new Dictionary<uint, Guid>();
+            foreach (var mapping in byPlayniteId)
             {
-                // User chose "Skip All" - skip remaining games silently
-                skipped++;
-                skippedGames.Add($"{g.Name}: {Constants.SkipReasonUserSkipped}");
-                continue;
+                if (Guid.TryParse(mapping.Key, out var mappedGameId) && mappedGameId != Guid.Empty &&
+                    !TryClaimBatchAppId(batchAppIdOwners, mappedGameId, mapping.Value))
+                {
+                    batchAppIdOwners[mapping.Value] = Guid.Empty;
+                }
             }
-            
-            if (action == null || result != ExeDiscoveryResult.Success)
+            var context = new ExportContext { SkipAllRemaining = false };
+
+            foreach (var g in selectedGames)
             {
-                skipped++;
-                var reason = GetSkipReason(g, result);
-                skippedGames.Add($"{g.Name}: {reason}");
-                Logger.Debug($"Skipping '{g.Name}': {reason}");
-                continue;
+                var (exePath, workDir, name, action, result) = GetGameActionDetailsWithFallback(g, existing, byPlayniteId, context);
+
+                if (result == ExeDiscoveryResult.UserSkippedAll)
+                {
+                    // User chose "Skip All" - skip remaining games silently
+                    skipped++;
+                    skippedGames.Add($"{g.Name}: {Constants.SkipReasonUserSkipped}");
+                    continue;
+                }
+
+                if (action == null || result != ExeDiscoveryResult.Success)
+                {
+                    skipped++;
+                    var reason = GetSkipReason(g, result);
+                    skippedGames.Add($"{g.Name}: {reason}");
+                    Logger.Debug($"Skipping '{g.Name}': {reason}");
+                    continue;
+                }
+
+                var appId = CreateOrUpdateShortcut(g, exePath, workDir, name, action, shortcuts, existing, existingByStable, byPlayniteId, batchAppIdOwners, ref added, ref updated);
+                var exportedShortcut = shortcuts.FirstOrDefault(x => x.AppId == appId);
+                if (exportedShortcut != null)
+                {
+                    UpdateShortcutArtwork(g, exportedShortcut, vdfPath!);
+                    exported.Add(new ShortcutsLibrary.ExportedShortcut { Game = g, Shortcut = exportedShortcut });
+                }
+                UpdateGameActions(g, appId, exePath, workDir, action);
             }
 
-            var appId = CreateOrUpdateShortcut(g, exePath, workDir, name, action, shortcuts, existing, byPlayniteId, ref added, ref updated);
-            UpdateShortcutArtwork(g, appId, vdfPath!);
-            UpdateGameActions(g, appId, exePath, workDir, action);
+            if (exported.Count == 0)
+            {
+                Logger.Info("No selected game produced a valid Steam shortcut; the VDF and initial baseline were left unchanged.");
+                return new ExportResult { Added = added, Updated = updated, Skipped = skipped, SkippedGames = skippedGames };
+            }
+
+            WriteShortcutsWithBackup(vdfPath!, shortcuts, sourceFingerprint);
+        }
+        catch (Exception ex)
+        {
+            Logger.Error(ex, "Playnite to Steam export failed before it could be completed.");
+            _library.PlayniteApi.Dialogs.ShowErrorMessage($"Export failed. The shortcuts file was not confirmed as updated. Details: {ex.Message}", _library.Name);
+            return new ExportResult();
         }
 
-        WriteShortcutsWithBackup(vdfPath!, shortcuts);
-        return new ExportResult { Added = added, Updated = updated, Skipped = skipped, SkippedGames = skippedGames, WasSteamRunning = wasSteamRunning };
+        try
+        {
+            _library.RecordSuccessfulExports(exported, establishInitialBaseline);
+        }
+        catch (Exception ex)
+        {
+            Logger.Error(ex, "Steam shortcuts were written, but the baseline state could not be saved.");
+            _library.PlayniteApi.Dialogs.ShowErrorMessage("Steam shortcuts were written, but the automatic-sync baseline could not be saved. Verify the Steam entries before repeating the initial export.", _library.Name);
+            return new ExportResult();
+        }
+
+        return new ExportResult { Added = added, Updated = updated, Skipped = skipped, SkippedGames = skippedGames };
     }
 
     private static string GetSkipReason(Game g, ExeDiscoveryResult result)
@@ -522,13 +627,9 @@ internal class ImportExportService
     }
 
     /// <summary>
-    /// Gets game action details with fallback chain for games.
-    /// Fallback order:
-    /// 1. GameActions with File type
-    /// 2. GameActions with Emulator type (resolves emulator profile)
-    /// 3. GameActions with URL type (double-launcher)
-    /// 4. Exe discovery from InstallDirectory
-    /// 5. Browse dialog (if ambiguous or not found)
+    /// Gets game action details, preferring Playnite's designated Play action.
+    /// When no action is designated, supported action types fall back to File, Emulator, then URL.
+    /// Executable discovery and the browse dialog are used only when no supported action resolves.
     /// </summary>
     private (string exePath, string? workDir, string name, GameAction? action, ExeDiscoveryResult result) GetGameActionDetailsWithFallback(
         Game g, 
@@ -542,16 +643,24 @@ internal class ImportExportService
             return (string.Empty, null, string.Empty, null, ExeDiscoveryResult.UserSkippedAll);
         }
 
-        // 1. Try existing File action first
-        var fileAction = g.GameActions?.FirstOrDefault(a => a.Type == GameActionType.File && !string.IsNullOrEmpty(a.Path));
+        // Prefer Playnite's designated Play action, then use a supported-action fallback.
+        var selectedAction = GameActionSelector.GetPreferredLaunchAction(g.GameActions);
+        if (selectedAction == null && g.GameActions?.Any(action => action != null && action.IsPlayAction) != true)
+        {
+            selectedAction = GameActionSelector.TryCreateSingleDynamicPlayAction(
+                g,
+                _library.PlayniteApi.Addons.Plugins,
+                GameActionSelector.GetCurrentProcessExecutablePath(),
+                Logger);
+        }
+        var fileAction = selectedAction?.Type == GameActionType.File ? selectedAction : null;
         if (fileAction != null)
         {
             var result = BuildFileActionResult(g, fileAction);
             return (result.exePath, result.workDir, result.name, fileAction, ExeDiscoveryResult.Success);
         }
 
-        // 2. Try Emulator action
-        var emulatorAction = g.GameActions?.FirstOrDefault(a => a.Type == GameActionType.Emulator);
+        var emulatorAction = selectedAction?.Type == GameActionType.Emulator ? selectedAction : null;
         if (emulatorAction != null)
         {
             var result = BuildEmulatorActionResult(g, emulatorAction);
@@ -562,8 +671,7 @@ internal class ImportExportService
             }
         }
 
-        // 3. Try URL action (double-launcher fallback)
-        var urlAction = g.GameActions?.FirstOrDefault(a => a.Type == GameActionType.URL && !string.IsNullOrEmpty(a.Path));
+        var urlAction = selectedAction?.Type == GameActionType.URL ? selectedAction : null;
         if (urlAction != null)
         {
             var result = BuildUrlActionResult(g, urlAction, existing, byPlayniteId);
@@ -575,6 +683,12 @@ internal class ImportExportService
         }
 
         // 4. No valid GameActions - try exe discovery
+        if (g.GameActions?.Any(action => action != null && action.IsPlayAction) == true)
+        {
+            Logger.Warn($"Cannot export '{g.Name}': the configured Play action is not directly supported by Steam shortcuts.");
+            return (string.Empty, null, g.Name ?? string.Empty, null, ExeDiscoveryResult.NoAction);
+        }
+
         if (!string.IsNullOrEmpty(g.InstallDirectory) && Directory.Exists(g.InstallDirectory))
         {
             // First try automatic discovery
@@ -607,6 +721,99 @@ internal class ImportExportService
         // 5. Nothing found - skip
         Logger.Warn($"Cannot export '{g.Name}': No GameActions, no InstallDirectory, or InstallDirectory doesn't exist.");
         return (string.Empty, null, string.Empty, null, ExeDiscoveryResult.NoAction);
+    }
+
+    internal bool TryCreateAutomaticShortcut(Game game, uint preferredAppId, out SyncPreparedShortcut shortcut, out string reason)
+    {
+        shortcut = new SyncPreparedShortcut();
+        reason = string.Empty;
+        if (game == null)
+        {
+            reason = "The Playnite game record is unavailable.";
+            return false;
+        }
+
+        var selectedAction = GameActionSelector.GetPreferredLaunchAction(game.GameActions);
+        var fileAction = selectedAction?.Type == GameActionType.File ? selectedAction : null;
+        var emulatorAction = selectedAction?.Type == GameActionType.Emulator ? selectedAction : null;
+        var urlAction = selectedAction?.Type == GameActionType.URL ? selectedAction : null;
+        string exePath;
+        string? workDir;
+        string launchOptions;
+
+        if (fileAction != null)
+        {
+            var expandedAction = _library.PlayniteApi.ExpandGameVariables(game, fileAction);
+            var result = BuildFileActionResult(game, expandedAction);
+            exePath = result.exePath;
+            workDir = result.workDir;
+            var expandedArguments = Environment.ExpandEnvironmentVariables(expandedAction.Arguments ?? string.Empty);
+            launchOptions = EmulatorPathUtils.QuoteArgumentsIfNeeded(expandedArguments ?? string.Empty);
+        }
+        else if (emulatorAction != null)
+        {
+            var result = BuildEmulatorActionResult(game, emulatorAction);
+            if (result.action == null)
+            {
+                reason = "The emulator profile or executable could not be resolved.";
+                return false;
+            }
+
+            var resolved = BuildFileActionResult(game, result.action);
+            exePath = resolved.exePath;
+            workDir = resolved.workDir;
+            // BuildEmulatorActionResult already expands Playnite variables, including {ImagePath}.
+            // Passing a full command line through the path resolver treats flags as filesystem paths.
+            launchOptions = EmulatorPathUtils.QuoteArgumentsIfNeeded(
+                Environment.ExpandEnvironmentVariables(result.action.Arguments ?? string.Empty));
+        }
+        else if (urlAction != null)
+        {
+            exePath = _library.PlayniteApi.ExpandGameVariables(game, urlAction.Path);
+            workDir = !string.IsNullOrWhiteSpace(game.InstallDirectory) && Directory.Exists(game.InstallDirectory)
+                ? game.InstallDirectory
+                : null;
+            launchOptions = exePath;
+        }
+        else
+        {
+            reason = "No supported File, Emulator, or URL launch action is configured.";
+            return false;
+        }
+
+        if (string.IsNullOrWhiteSpace(exePath))
+        {
+            reason = "The launch action resolved to an empty executable or URL.";
+            return false;
+        }
+
+        var unresolvedVariable = EmulatorPathUtils.FindUnexpandedGameVariable(exePath, workDir, launchOptions);
+        if (unresolvedVariable != null)
+        {
+            reason = $"Playnite variable {unresolvedVariable} could not be resolved from the persisted game snapshot.";
+            return false;
+        }
+
+        var appId = preferredAppId;
+        if (appId == 0 && urlAction != null)
+        {
+            appId = SteamPathResolver.TryParseAppIdFromRungameUrl(exePath);
+        }
+        if (appId == 0)
+        {
+            appId = Utils.GenerateShortcutAppId(exePath, game.Name ?? string.Empty);
+        }
+
+        shortcut = new SyncPreparedShortcut
+        {
+            AppId = appId,
+            AppName = game.Name ?? string.Empty,
+            Exe = exePath,
+            StartDir = workDir ?? string.Empty,
+            LaunchOptions = launchOptions,
+            Tags = new List<string>()
+        };
+        return true;
     }
 
     private (string exePath, string? workDir, string name) BuildFileActionResult(Game g, GameAction fileAction)
@@ -1030,7 +1237,7 @@ internal class ImportExportService
 
     
 
-    private uint CreateOrUpdateShortcut(Game g, string exePath, string? workDir, string name, GameAction action, List<SteamShortcut> shortcuts, Dictionary<uint, SteamShortcut> existing, Dictionary<string, uint> byPlayniteId, ref int added, ref int updated)
+    private uint CreateOrUpdateShortcut(Game g, string exePath, string? workDir, string name, GameAction action, List<SteamShortcut> shortcuts, Dictionary<uint, SteamShortcut> existing, Dictionary<string, List<SteamShortcut>> existingByStable, Dictionary<string, uint> byPlayniteId, Dictionary<uint, Guid> batchAppIdOwners, ref int added, ref int updated)
     {
         uint resolvedExistingAppId = 0;
         if (byPlayniteId.TryGetValue(g.Id.ToString(), out var mappedAppId) && mappedAppId != 0)
@@ -1046,18 +1253,49 @@ internal class ImportExportService
             }
         }
 
+        if (resolvedExistingAppId == 0)
+        {
+            if (TryResolveStableShortcutAppId(name, exePath, existingByStable, out var stableAppId, out var stableError))
+            {
+                resolvedExistingAppId = stableAppId;
+            }
+            else if (!string.IsNullOrEmpty(stableError))
+            {
+                throw new InvalidDataException(stableError);
+            }
+        }
+
         var appId = resolvedExistingAppId != 0 ? resolvedExistingAppId : Utils.GenerateShortcutAppId(exePath, name);
+        if (!TryClaimBatchAppId(batchAppIdOwners, g.Id, appId))
+        {
+            throw new InvalidDataException($"More than one Playnite game maps to Steam AppID {appId}. Resolve the conflicting export mapping before writing this batch.");
+        }
+        var newStableId = new SteamShortcut { AppName = name, Exe = exePath }.StableId;
         if (!existing.TryGetValue(appId, out var sc))
         {
             sc = new SteamShortcut { AppName = name, Exe = exePath, StartDir = workDir ?? string.Empty, AppId = appId };
             shortcuts.Add(sc);
+            existing[appId] = sc;
             added++;
         }
         else
         {
+            var matchesResolvedIdentity = resolvedExistingAppId == appId ||
+                string.Equals(sc.StableId, newStableId, StringComparison.OrdinalIgnoreCase);
+            if (!matchesResolvedIdentity)
+            {
+                throw new InvalidDataException($"AppID {appId} is already used by a different Steam shortcut. The batch was not written.");
+            }
+
+            var oldStableId = sc.StableId;
             sc.AppName = name;
             sc.Exe = exePath;
             sc.StartDir = workDir ?? sc.StartDir;
+            if (existingByStable.TryGetValue(oldStableId, out var oldMatches))
+            {
+                oldMatches.RemoveAll(match => ReferenceEquals(match, sc));
+                if (oldMatches.Count == 0) existingByStable.Remove(oldStableId);
+            }
             updated++;
         }
 
@@ -1067,42 +1305,64 @@ internal class ImportExportService
         }
         else if (action.Type == GameActionType.File)
         {
-            var expandedArgs = _pathResolver.ExpandPathVariables(g, action.Arguments) ?? string.Empty;
+            var expandedArgs = _pathResolver.ExpandArgumentVariables(g, action.Arguments) ?? string.Empty;
             sc.LaunchOptions = EmulatorPathUtils.QuoteArgumentsIfNeeded(expandedArgs);
         }
 
-        try
+        if (!existingByStable.TryGetValue(sc.StableId, out var newMatches))
         {
-            if (g.Id != Guid.Empty)
-            {
-                _library.Settings.ExportMap[appId.ToString()] = g.Id.ToString();
-                _library.SavePluginSettings(_library.Settings);
-            }
+            newMatches = new List<SteamShortcut>();
+            existingByStable[sc.StableId] = newMatches;
         }
-        catch (Exception ex)
-        {
-            Logger.Warn(ex, "Failed to record export mapping.");
-        }
+        if (!newMatches.Contains(sc)) newMatches.Add(sc);
+        byPlayniteId[g.Id.ToString("D")] = appId;
 
         return appId;
     }
 
-    private void UpdateShortcutArtwork(Game g, uint appId, string vdfPath)
+    internal static bool TryClaimBatchAppId(IDictionary<uint, Guid> owners, Guid gameId, uint appId)
+    {
+        if (owners == null) throw new ArgumentNullException(nameof(owners));
+        if (gameId == Guid.Empty || appId == 0) return false;
+        if (owners.TryGetValue(appId, out var owner) && owner != gameId) return false;
+        owners[appId] = gameId;
+        return true;
+    }
+
+    internal static bool TryResolveStableShortcutAppId(
+        string appName,
+        string exePath,
+        IDictionary<string, List<SteamShortcut>> existingByStable,
+        out uint appId,
+        out string error)
+    {
+        if (existingByStable == null) throw new ArgumentNullException(nameof(existingByStable));
+        appId = 0;
+        error = string.Empty;
+        var stableId = new SteamShortcut { AppName = appName ?? string.Empty, Exe = exePath ?? string.Empty }.StableId;
+        if (!existingByStable.TryGetValue(stableId, out var matches)) return false;
+        if (matches.Count != 1 || matches[0].AppId == 0)
+        {
+            error = $"Steam contains {matches.Count} ambiguous shortcuts matching '{appName}'. Resolve the duplicate entries before exporting this batch.";
+            return false;
+        }
+
+        appId = matches[0].AppId;
+        return true;
+    }
+
+    private void UpdateShortcutArtwork(Game g, SteamShortcut shortcut, string vdfPath)
     {
         try
         {
             var gridDir = _artworkManager.TryGetGridDirFromVdf(vdfPath);
             if (!string.IsNullOrEmpty(gridDir))
             {
-                _artworkManager.TryExportArtworkToGrid(g, appId, gridDir);
-                var iconPath = _artworkManager.TryGetGridIconPath(appId, gridDir);
+                _artworkManager.TryExportArtworkToGrid(g, shortcut.AppId, gridDir);
+                var iconPath = _artworkManager.TryGetGridIconPath(shortcut.AppId, gridDir);
                 if (!string.IsNullOrEmpty(iconPath))
                 {
-                    var sc = ShortcutsFile.Read(vdfPath).FirstOrDefault(s => s.AppId == appId);
-                    if (sc != null)
-                    {
-                        sc.Icon = iconPath!;
-                    }
+                    shortcut.Icon = iconPath!;
                 }
             }
         }
@@ -1122,7 +1382,7 @@ internal class ImportExportService
             if (!hasEmulatorAction)
             {
                 var fileArgs = action.Type == GameActionType.File
-                    ? EmulatorPathUtils.QuoteArgumentsIfNeeded(_pathResolver.ExpandPathVariables(g, action.Arguments))
+                    ? EmulatorPathUtils.QuoteArgumentsIfNeeded(_pathResolver.ExpandArgumentVariables(g, action.Arguments))
                     : null;
                 _library.EnsureFileActionForExternalGame(g, exePath, workDir, fileArgs);
             }
@@ -1144,19 +1404,9 @@ internal class ImportExportService
             || val.StartsWith("steam://", StringComparison.OrdinalIgnoreCase);
     }
 
-    public void WriteShortcutsWithBackup(string vdfPath, List<SteamShortcut> shortcuts)
+    public void WriteShortcutsWithBackup(string vdfPath, List<SteamShortcut> shortcuts, string? expectedFingerprint = null)
     {
-        try
-        {
-            var userId = BackupManager.TryGetSteamUserFromPath(vdfPath) ?? Constants.DefaultUserSegment;
-            _backupManager.CreateManagedBackup(vdfPath, userId);
-        }
-        catch (Exception ex)
-        {
-            Logger.Warn(ex, "Creating shortcuts.vdf backup failed");
-        }
-
-        ShortcutsFile.Write(vdfPath, shortcuts);
+        _backupManager.WriteShortcutsWithBackup(vdfPath, shortcuts, expectedFingerprint);
     }
 
     private sealed class ExportResult 
@@ -1165,7 +1415,6 @@ internal class ImportExportService
         public int Updated; 
         public int Skipped;
         public List<string> SkippedGames = new List<string>();
-        public bool WasSteamRunning;
     }
 
     /// <summary>
@@ -1183,15 +1432,17 @@ internal class ImportExportService
     {
         public static SelectionCandidate Empty { get; } = new SelectionCandidate(string.Empty, false, false);
 
-        public SelectionCandidate(string label, bool hasPlayableAction, bool existsInSteam)
+        public SelectionCandidate(string label, bool hasPlayableAction, bool existsInSteam, bool hasSupportedLaunchAction = false)
         {
             Label = label;
             HasPlayableAction = hasPlayableAction;
             ExistsInSteam = existsInSteam;
+            HasSupportedLaunchAction = hasSupportedLaunchAction;
         }
 
         public string Label { get; }
         public bool HasPlayableAction { get; }
+        public bool HasSupportedLaunchAction { get; }
         public bool ExistsInSteam { get; }
         public bool ShouldSelect => HasPlayableAction && !ExistsInSteam;
         public bool IsNew => ShouldSelect;

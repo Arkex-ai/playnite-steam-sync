@@ -41,6 +41,7 @@ public class SteamUsersReaderTests
             Assert.Equal("Test User 1", result["76561198000000001"].PersonaName);
             Assert.Equal("Test User 2", result["76561198000000002"].PersonaName);
             Assert.Equal("Test User 1", result["76561198000000001"].DisplayName);
+            Assert.False(result["76561198000000001"].MostRecent);
         }
         finally
         {
@@ -226,17 +227,47 @@ public class SteamUsersReaderTests
             var configDir = Path.Combine(tempRoot, "config");
             Directory.CreateDirectory(configDir);
 
-            // Exact format from user's real loginusers.vdf with tabs
-            var loginusersContent = "\"users\"\n{\n\t\"76561198051525001\"\n\t{\n\t\t\"AccountName\"\t\t\"testuser1\"\n\t\t\"PersonaName\"\t\t\"Test Display 1\"\n\t\t\"RememberPassword\"\t\t\"1\"\n\t\t\"WantsOfflineMode\"\t\t\"0\"\n\t\t\"SkipOfflineModeWarning\"\t\t\"0\"\n\t\t\"AllowAutoLogin\"\t\t\"1\"\n\t\t\"MostRecent\"\t\t\"1\"\n\t\t\"Timestamp\"\t\t\"1772589956\"\n\t}\n\t\"76561198391833687\"\n\t{\n\t\t\"AccountName\"\t\t\"testuser2\"\n\t\t\"PersonaName\"\t\t\"Test Display 2\"\n\t\t\"RememberPassword\"\t\t\"1\"\n\t\t\"WantsOfflineMode\"\t\t\"0\"\n\t\t\"SkipOfflineModeWarning\"\t\t\"0\"\n\t\t\"AllowAutoLogin\"\t\t\"0\"\n\t\t\"MostRecent\"\t\t\"0\"\n\t\t\"Timestamp\"\t\t\"1771962844\"\n\t}\n}";
+            // Representative loginusers.vdf format with tab indentation
+            var loginusersContent = "\"users\"\n{\n\t\"76561197960265729\"\n\t{\n\t\t\"AccountName\"\t\t\"testuser1\"\n\t\t\"PersonaName\"\t\t\"Test Display 1\"\n\t\t\"RememberPassword\"\t\t\"1\"\n\t\t\"WantsOfflineMode\"\t\t\"0\"\n\t\t\"SkipOfflineModeWarning\"\t\t\"0\"\n\t\t\"AllowAutoLogin\"\t\t\"1\"\n\t\t\"MostRecent\"\t\t\"1\"\n\t\t\"Timestamp\"\t\t\"1700000000\"\n\t}\n\t\"76561197960265730\"\n\t{\n\t\t\"AccountName\"\t\t\"testuser2\"\n\t\t\"PersonaName\"\t\t\"Test Display 2\"\n\t\t\"RememberPassword\"\t\t\"1\"\n\t\t\"WantsOfflineMode\"\t\t\"0\"\n\t\t\"SkipOfflineModeWarning\"\t\t\"0\"\n\t\t\"AllowAutoLogin\"\t\t\"0\"\n\t\t\"MostRecent\"\t\t\"0\"\n\t\t\"Timestamp\"\t\t\"1700000001\"\n\t}\n}";
             File.WriteAllText(Path.Combine(configDir, "loginusers.vdf"), loginusersContent);
 
             var result = SteamUsersReader.ReadUsers(tempRoot);
 
             Assert.Equal(2, result.Count);
-            Assert.Equal("testuser1", result["76561198051525001"].AccountName);
-            Assert.Equal("Test Display 1", result["76561198051525001"].PersonaName);
-            Assert.Equal("Test Display 1", result["76561198051525001"].DisplayName);
-            Assert.Equal("Test Display 2", result["76561198391833687"].DisplayName);
+            Assert.Equal("testuser1", result["76561197960265729"].AccountName);
+            Assert.Equal("Test Display 1", result["76561197960265729"].PersonaName);
+            Assert.Equal("Test Display 1", result["76561197960265729"].DisplayName);
+            Assert.Equal("Test Display 2", result["76561197960265730"].DisplayName);
+            Assert.True(result["76561197960265729"].MostRecent);
+            Assert.False(result["76561197960265730"].MostRecent);
+            Assert.Equal("76561197960265729", SteamUsersReader.GetMostRecentUserId(tempRoot));
+        }
+        finally
+        {
+            if (Directory.Exists(tempRoot))
+                Directory.Delete(tempRoot, recursive: true);
+        }
+    }
+
+    [Fact]
+    public void GetMostRecentUserId_InvalidatesCachedFileWhenMetadataChanges()
+    {
+        var tempRoot = Path.Combine(Path.GetTempPath(), "steam_users_test_" + Guid.NewGuid().ToString("N"));
+        try
+        {
+            var configDir = Path.Combine(tempRoot, "config");
+            Directory.CreateDirectory(configDir);
+            var loginusersPath = Path.Combine(configDir, "loginusers.vdf");
+            var first = "\"users\"\n{\n\t\"76561198000000001\"\n\t{\n\t\t\"MostRecent\"\t\t\"1\"\n\t}\n\t\"76561198000000002\"\n\t{\n\t\t\"MostRecent\"\t\t\"0\"\n\t}\n}";
+            var second = "\"users\"\n{\n\t\"76561198000000001\"\n\t{\n\t\t\"MostRecent\"\t\t\"0\"\n\t}\n\t\"76561198000000002\"\n\t{\n\t\t\"MostRecent\"\t\t\"1\"\n\t}\n}";
+            File.WriteAllText(loginusersPath, first);
+
+            Assert.Equal("76561198000000001", SteamUsersReader.GetMostRecentUserId(tempRoot));
+            var nextTimestamp = File.GetLastWriteTimeUtc(loginusersPath).AddSeconds(3);
+            File.WriteAllText(loginusersPath, second);
+            File.SetLastWriteTimeUtc(loginusersPath, nextTimestamp);
+
+            Assert.Equal("76561198000000002", SteamUsersReader.GetMostRecentUserId(tempRoot));
         }
         finally
         {

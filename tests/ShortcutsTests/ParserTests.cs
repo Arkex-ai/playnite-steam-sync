@@ -1,6 +1,7 @@
 using System;
 using System.IO;
 using System.Linq;
+using System.Collections.Generic;
 using Xunit;
 
 namespace SteamShortcutsImporter.Tests;
@@ -47,6 +48,29 @@ public class ParserTests
     }
 
     [Fact]
+    public void WriteAtomic_PreservesNumericShortcutOrderPastNineEntries()
+    {
+        var tmp = Path.Combine(Path.GetTempPath(), "shortcuts_order_" + Guid.NewGuid().ToString("N") + ".vdf");
+
+        try
+        {
+            var shortcuts = Enumerable.Range(0, 12)
+                .Select(index => new SteamShortcut { AppName = "Game " + index, Exe = "game" + index + ".exe", AppId = (uint)(1000 + index) })
+                .ToList();
+
+            ShortcutsFile.WriteAtomic(tmp, shortcuts);
+
+            var loaded = ShortcutsFile.Read(tmp).ToList();
+            Assert.Equal(shortcuts.Select(item => item.AppName), loaded.Select(item => item.AppName));
+            Assert.Equal(shortcuts.Select(item => item.AppId), loaded.Select(item => item.AppId));
+        }
+        finally
+        {
+            if (File.Exists(tmp)) File.Delete(tmp);
+        }
+    }
+
+    [Fact]
     public void StableId_ConsistentAcrossQuotedAndUnquotedPaths()
     {
         var shortcut1 = new SteamShortcut
@@ -80,6 +104,127 @@ public class ParserTests
         };
 
         Assert.NotEqual(shortcut1.StableId, shortcut2.StableId);
+    }
+
+    [Fact]
+    public void WriteAtomic_PreservesUnknownShortcutFields()
+    {
+        var tmp = Path.Combine(Path.GetTempPath(), "shortcuts_unknown_" + Guid.NewGuid().ToString("N") + ".vdf");
+        try
+        {
+            var shortcut = new SteamShortcut
+            {
+                AppName = "Preserve Me",
+                Exe = @"C:\\Games\\Preserve.exe",
+                AppId = 123456,
+                ExtraFields = new Dictionary<string, object>
+                {
+                    ["FutureIntField"] = 42,
+                    ["FutureObjectField"] = new Dictionary<string, object> { ["Nested"] = "kept" }
+                }
+            };
+            ShortcutsFile.Write(tmp, new[] { shortcut });
+
+            var loaded = ShortcutsFile.Read(tmp).Single();
+            loaded.AppName = "Preserve Me Updated";
+            ShortcutsFile.WriteAtomic(tmp, new[] { loaded });
+
+            using var stream = File.OpenRead(tmp);
+            var root = BinaryKv.ReadObject(stream);
+            var shortcuts = Assert.IsType<Dictionary<string, object>>(root[Constants.ShortcutsKey]);
+            var raw = Assert.IsType<Dictionary<string, object>>(shortcuts["0"]);
+            Assert.Equal(42, raw["FutureIntField"]);
+            var nested = Assert.IsType<Dictionary<string, object>>(raw["FutureObjectField"]);
+            Assert.Equal("kept", nested["Nested"]);
+            Assert.Equal("Preserve Me Updated", raw[Constants.AppNameKey]);
+        }
+        finally
+        {
+            if (File.Exists(tmp)) File.Delete(tmp);
+        }
+    }
+
+    [Fact]
+    public void WriteAtomic_WhenSafetyCheckFails_LeavesOriginalUntouched()
+    {
+        var tmp = Path.Combine(Path.GetTempPath(), "shortcuts_atomic_" + Guid.NewGuid().ToString("N") + ".vdf");
+        try
+        {
+            ShortcutsFile.Write(tmp, new[] { new SteamShortcut { AppName = "Original", Exe = "game.exe", AppId = 22 } });
+            var original = File.ReadAllBytes(tmp);
+            var changed = new[] { new SteamShortcut { AppName = "Changed", Exe = "other.exe", AppId = 33 } };
+
+            Assert.Throws<OperationCanceledException>(() => ShortcutsFile.WriteAtomic(tmp, changed, () => false));
+            Assert.Equal(original, File.ReadAllBytes(tmp));
+        }
+        finally
+        {
+            if (File.Exists(tmp)) File.Delete(tmp);
+        }
+    }
+
+    [Fact]
+    public void WriteAtomic_WhenTargetIsLocked_LeavesOriginalUntouchedAndRemovesTemporaryFile()
+    {
+        var tmp = Path.Combine(Path.GetTempPath(), "shortcuts_atomic_locked_" + Guid.NewGuid().ToString("N") + ".vdf");
+        try
+        {
+            ShortcutsFile.Write(tmp, new[] { new SteamShortcut { AppName = "Original", Exe = "game.exe", AppId = 22 } });
+            var original = File.ReadAllBytes(tmp);
+            var changed = new[] { new SteamShortcut { AppName = "Changed", Exe = "other.exe", AppId = 33 } };
+
+            using (File.Open(tmp, FileMode.Open, FileAccess.Read, FileShare.None))
+            {
+                Assert.ThrowsAny<IOException>(() => ShortcutsFile.WriteAtomic(tmp, changed));
+            }
+
+            Assert.Equal(original, File.ReadAllBytes(tmp));
+            Assert.Empty(Directory.GetFiles(Path.GetDirectoryName(tmp)!, Path.GetFileName(tmp) + ".*.tmp"));
+        }
+        finally
+        {
+            if (File.Exists(tmp)) File.Delete(tmp);
+            foreach (var tempPath in Directory.GetFiles(Path.GetDirectoryName(tmp)!, Path.GetFileName(tmp) + ".*.tmp"))
+            {
+                File.Delete(tempPath);
+            }
+        }
+    }
+
+    [Fact]
+    public void WriteAtomic_WhenSafetyCheckDetectsConcurrentUpdate_PreservesNewTargetAndRemovesTemporaryFile()
+    {
+        var tmp = Path.Combine(Path.GetTempPath(), "shortcuts_atomic_race_" + Guid.NewGuid().ToString("N") + ".vdf");
+        try
+        {
+            ShortcutsFile.Write(tmp, new[] { new SteamShortcut { AppName = "Original", Exe = "original.exe", AppId = 22 } });
+            var originalFingerprint = ShortcutsFile.GetFileFingerprint(tmp);
+            var concurrentShortcut = new SteamShortcut { AppName = "Concurrent update", Exe = "concurrent.exe", AppId = 44 };
+            var queuedShortcut = new SteamShortcut { AppName = "Queued update", Exe = "queued.exe", AppId = 33 };
+            var detectedConcurrentUpdate = false;
+
+            Assert.Throws<OperationCanceledException>(() => ShortcutsFile.WriteAtomic(tmp, new[] { queuedShortcut }, () =>
+            {
+                ShortcutsFile.Write(tmp, new[] { concurrentShortcut });
+                detectedConcurrentUpdate = !string.Equals(
+                    originalFingerprint,
+                    ShortcutsFile.GetFileFingerprint(tmp),
+                    StringComparison.Ordinal);
+                return !detectedConcurrentUpdate;
+            }));
+
+            Assert.True(detectedConcurrentUpdate);
+            Assert.Equal("Concurrent update", ShortcutsFile.Read(tmp).Single().AppName);
+            Assert.Empty(Directory.GetFiles(Path.GetDirectoryName(tmp)!, Path.GetFileName(tmp) + ".*.tmp"));
+        }
+        finally
+        {
+            if (File.Exists(tmp)) File.Delete(tmp);
+            foreach (var tempPath in Directory.GetFiles(Path.GetDirectoryName(tmp)!, Path.GetFileName(tmp) + ".*.tmp"))
+            {
+                File.Delete(tempPath);
+            }
+        }
     }
 
     [Fact]
@@ -148,6 +293,85 @@ public class ParserTests
         var nonExistentPath = Path.Combine(Path.GetTempPath(), "nonexistent_" + Guid.NewGuid().ToString("N") + ".vdf");
         
         Assert.Throws<FileNotFoundException>(() => ShortcutsFile.Read(nonExistentPath).ToList());
+    }
+
+    [Fact]
+    public void Read_UnexpectedRootData_ThrowsInsteadOfSilentlyDroppingIt()
+    {
+        var tmp = Path.Combine(Path.GetTempPath(), "shortcuts_unexpected_root_" + Guid.NewGuid().ToString("N") + ".vdf");
+        try
+        {
+            using var stream = new MemoryStream();
+            BinaryKv.WriteObject(stream, new Dictionary<string, object>
+            {
+                [Constants.ShortcutsKey] = new Dictionary<string, object>(),
+                ["FutureRootField"] = "must be preserved"
+            });
+            File.WriteAllBytes(tmp, stream.ToArray());
+
+            Assert.Throws<InvalidDataException>(() => ShortcutsFile.Read(tmp).ToList());
+        }
+        finally
+        {
+            if (File.Exists(tmp)) File.Delete(tmp);
+        }
+    }
+
+    [Fact]
+    public void Read_NonemptyRootWithoutShortcuts_ThrowsInvalidDataException()
+    {
+        var tmp = Path.Combine(Path.GetTempPath(), "shortcuts_missing_root_key_" + Guid.NewGuid().ToString("N") + ".vdf");
+        try
+        {
+            using var stream = new MemoryStream();
+            BinaryKv.WriteObject(stream, new Dictionary<string, object> { ["Unexpected"] = "data" });
+            File.WriteAllBytes(tmp, stream.ToArray());
+
+            Assert.Throws<InvalidDataException>(() => ShortcutsFile.Read(tmp).ToList());
+        }
+        finally
+        {
+            if (File.Exists(tmp)) File.Delete(tmp);
+        }
+    }
+
+    [Fact]
+    public void Read_EmptyRootObject_ReturnsEmptyLibrary()
+    {
+        var tmp = Path.Combine(Path.GetTempPath(), "shortcuts_empty_root_" + Guid.NewGuid().ToString("N") + ".vdf");
+        try
+        {
+            using var stream = new MemoryStream();
+            BinaryKv.WriteObject(stream, new Dictionary<string, object>());
+            File.WriteAllBytes(tmp, stream.ToArray());
+
+            Assert.Empty(ShortcutsFile.Read(tmp));
+        }
+        finally
+        {
+            if (File.Exists(tmp)) File.Delete(tmp);
+        }
+    }
+
+    [Fact]
+    public void Read_NonObjectShortcutEntry_ThrowsInsteadOfDroppingIt()
+    {
+        var tmp = Path.Combine(Path.GetTempPath(), "shortcuts_invalid_entry_" + Guid.NewGuid().ToString("N") + ".vdf");
+        try
+        {
+            using var stream = new MemoryStream();
+            BinaryKv.WriteObject(stream, new Dictionary<string, object>
+            {
+                [Constants.ShortcutsKey] = new Dictionary<string, object> { ["0"] = "unexpected scalar" }
+            });
+            File.WriteAllBytes(tmp, stream.ToArray());
+
+            Assert.Throws<InvalidDataException>(() => ShortcutsFile.Read(tmp).ToList());
+        }
+        finally
+        {
+            if (File.Exists(tmp)) File.Delete(tmp);
+        }
     }
 
     [Fact]

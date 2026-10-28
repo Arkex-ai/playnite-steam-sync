@@ -18,6 +18,8 @@ public class PluginSettingsView : UserControl
     private CheckBox? _launchCheck;
     private CheckBox? _steamDefaultCheckBox;
     private ComboBox? _userComboBox;
+    private StackPanel? _autoSyncSourcesPanel;
+    private TextBlock? _autoSyncStatusText;
     private string? _currentSteamRootPath;
     private bool _isRefreshingUsers;
 
@@ -122,6 +124,94 @@ public class PluginSettingsView : UserControl
         // Set initial enabled state for default checkbox
         Loaded += InitializeDefaultCheckBoxState;
 
+        var syncHeader = new TextBlock
+        {
+            Text = "Automatic Playnite → Steam sync",
+            FontWeight = FontWeights.Bold,
+            FontSize = 11,
+            Margin = new Thickness(0, 14, 0, 0)
+        };
+        panel.Children.Add(syncHeader);
+
+        var autoSyncCheck = new CheckBox
+        {
+            Content = "Automatically add eligible new games to Steam",
+            Margin = new Thickness(0, 5, 0, 0)
+        };
+        autoSyncCheck.SetBinding(System.Windows.Controls.Primitives.ToggleButton.IsCheckedProperty,
+            new System.Windows.Data.Binding("AutoSyncEnabled") { Mode = System.Windows.Data.BindingMode.TwoWay });
+        panel.Children.Add(autoSyncCheck);
+
+        panel.Children.Add(new TextBlock
+        {
+            Text = "Choose sources and filters before the first Playnite → Steam export. That first run adds or updates all matching supported games in one batch and establishes the baseline. Enable automatic sync afterward; normal launches of Playnite do not scan the full library.",
+            TextWrapping = TextWrapping.Wrap,
+            FontSize = 10,
+            Foreground = new SolidColorBrush(Color.FromRgb(128, 128, 128)),
+            Margin = new Thickness(18, 2, 0, 0),
+            MaxWidth = 510
+        });
+
+        AddSyncFilterCheckBox(panel, "AutoSyncOnlyInstalled", "Only installed games", true);
+        AddSyncFilterCheckBox(panel, "AutoSyncIncludeEmulators", "Include supported emulator actions", true);
+        AddSyncFilterCheckBox(panel, "AutoSyncIncludeUrls", "Include URL launch actions", true);
+
+        panel.Children.Add(new TextBlock
+        {
+            Text = "Library sources to watch:",
+            Margin = new Thickness(18, 6, 0, 0),
+            FontSize = 10
+        });
+        _autoSyncSourcesPanel = new StackPanel { Margin = new Thickness(28, 2, 0, 0) };
+        panel.Children.Add(_autoSyncSourcesPanel);
+
+        _autoSyncStatusText = new TextBlock
+        {
+            TextWrapping = TextWrapping.Wrap,
+            FontSize = 10,
+            Margin = new Thickness(18, 8, 0, 0),
+            MaxWidth = 510
+        };
+        panel.Children.Add(_autoSyncStatusText);
+
+        var syncActions = new StackPanel
+        {
+            Orientation = Orientation.Horizontal,
+            Margin = new Thickness(18, 4, 0, 0)
+        };
+        var refreshStatusButton = new Button { Content = "Refresh status", Padding = new Thickness(8, 2, 8, 2) };
+        refreshStatusButton.Click += (_, _) => RefreshAutoSyncStatus();
+        syncActions.Children.Add(refreshStatusButton);
+
+        var retryButton = new Button
+        {
+            Content = "Retry queued items",
+            Padding = new Thickness(8, 2, 8, 2),
+            Margin = new Thickness(5, 0, 0, 0)
+        };
+        retryButton.Click += (_, _) =>
+        {
+            ShortcutsLibrary.RetryAutomaticSync();
+            RefreshAutoSyncStatus();
+        };
+        syncActions.Children.Add(retryButton);
+
+        var reconcileButton = new Button
+        {
+            Content = "Reconcile library now",
+            Padding = new Thickness(8, 2, 8, 2),
+            Margin = new Thickness(5, 0, 0, 0)
+        };
+        reconcileButton.SetBinding(IsEnabledProperty,
+            new System.Windows.Data.Binding("AutoSyncEnabled") { Mode = System.Windows.Data.BindingMode.OneWay });
+        reconcileButton.Click += (_, _) =>
+        {
+            ShortcutsLibrary.ReconcileAutomaticSync();
+            RefreshAutoSyncStatus();
+        };
+        syncActions.Children.Add(reconcileButton);
+        panel.Children.Add(syncActions);
+
         // Steam user selection
         panel.Children.Add(new TextBlock
         {
@@ -158,7 +248,79 @@ public class PluginSettingsView : UserControl
         {
             UpdateValidation();
             RefreshUserList();
+            RefreshAutoSyncSources();
+            RefreshAutoSyncStatus();
         };
+    }
+
+    private void AddSyncFilterCheckBox(Panel panel, string settingPath, string label, bool indent)
+    {
+        var check = new CheckBox
+        {
+            Content = label,
+            Margin = new Thickness(indent ? 18 : 0, 3, 0, 0)
+        };
+        check.SetBinding(System.Windows.Controls.Primitives.ToggleButton.IsCheckedProperty,
+            new System.Windows.Data.Binding(settingPath) { Mode = System.Windows.Data.BindingMode.TwoWay });
+        panel.Children.Add(check);
+    }
+
+    private void RefreshAutoSyncSources()
+    {
+        if (_autoSyncSourcesPanel == null || _playniteApi?.Database?.Games == null) return;
+        _autoSyncSourcesPanel.Children.Clear();
+
+        var settings = DataContext as PluginSettings;
+        if (settings == null) return;
+
+        var games = _playniteApi.Database.Games.Where(g => g != null).ToList();
+        AutoSyncSourceSelector.MigrateLegacyPluginSelections(settings, games, Guid.Parse(Constants.PluginId));
+        var sources = AutoSyncSourceSelector.GetSources(games, Guid.Parse(Constants.PluginId));
+
+        foreach (var source in sources)
+        {
+            var sourceId = source.Id;
+            var check = new CheckBox
+            {
+                Content = source.Name,
+                Tag = sourceId,
+                IsChecked = settings.AutoSyncSourceIds.Any(x => string.Equals(x, sourceId, StringComparison.OrdinalIgnoreCase)),
+                Margin = new Thickness(0, 2, 0, 0)
+            };
+            check.Checked += AutoSyncSource_CheckedChanged;
+            check.Unchecked += AutoSyncSource_CheckedChanged;
+            _autoSyncSourcesPanel.Children.Add(check);
+        }
+
+        if (sources.Count == 0)
+        {
+            _autoSyncSourcesPanel.Children.Add(new TextBlock
+            {
+                Text = "Sources appear here after Playnite has imported games from them.",
+                FontSize = 10,
+                Foreground = new SolidColorBrush(Color.FromRgb(128, 128, 128))
+            });
+        }
+    }
+
+    private void AutoSyncSource_CheckedChanged(object sender, RoutedEventArgs e)
+    {
+        if (sender is not CheckBox check || check.Tag is not string sourceId || DataContext is not PluginSettings settings) return;
+
+        settings.AutoSyncSourceIds ??= new List<string>();
+        settings.AutoSyncSourceIds.RemoveAll(x => string.Equals(x, sourceId, StringComparison.OrdinalIgnoreCase));
+        if (check.IsChecked == true)
+        {
+            settings.AutoSyncSourceIds.Add(sourceId);
+        }
+    }
+
+    private void RefreshAutoSyncStatus()
+    {
+        if (_autoSyncStatusText != null)
+        {
+            _autoSyncStatusText.Text = ShortcutsLibrary.GetAutomaticSyncStatus();
+        }
     }
 
     private void BrowseButton_Click(object sender, RoutedEventArgs e)
@@ -382,20 +544,11 @@ public class PluginSettingsView : UserControl
                 return;
             }
 
-            // Check if Steam is running
-            if (SteamProcessHelper.IsSteamRunning())
+            // Restore only when Steam is verifiably closed.
+            if (!SteamProcessHelper.TryIsSteamRunning(out var steamRunning) || steamRunning)
             {
-                var steamResult = api.Dialogs.ShowMessage(
-                    SteamProcessHelper.GetSteamRunningWarning(),
-                    Constants.RestoreBackupDialogTitle,
-                    MessageBoxButton.YesNo,
-                    MessageBoxImage.Warning
-                );
-                
-                if (steamResult == MessageBoxResult.No)
-                {
-                    return;
-                }
+                api.Dialogs.ShowMessage(Constants.SteamMustBeClosedMessage, Constants.RestoreBackupDialogTitle);
+                return;
             }
 
             // Confirm restore

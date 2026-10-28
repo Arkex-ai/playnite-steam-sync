@@ -17,12 +17,18 @@ internal static class BinaryKv
     public static Dictionary<string, object> ReadObject(Stream stream)
     {
         using var br = new BinaryReader(stream, Encoding.UTF8, leaveOpen: true);
-        return ReadObject(br);
+        var result = ReadObject(br);
+        if (br.BaseStream.ReadByte() != -1)
+        {
+            throw new InvalidDataException("Malformed shortcuts.vdf: trailing data after the root object.");
+        }
+        return result;
     }
 
     private static Dictionary<string, object> ReadObject(BinaryReader br)
     {
         var obj = new Dictionary<string, object>(System.StringComparer.Ordinal);
+        var keys = new HashSet<string>(System.StringComparer.OrdinalIgnoreCase);
         while (true)
         {
             string? key = null;
@@ -38,6 +44,10 @@ internal static class BinaryKv
 
                 key = ReadCString(br);
                 position = br.BaseStream.Position;
+                if (!keys.Add(key))
+                {
+                    throw new InvalidDataException("Malformed shortcuts.vdf: duplicate key in an object.");
+                }
 
                 switch (t)
                 {

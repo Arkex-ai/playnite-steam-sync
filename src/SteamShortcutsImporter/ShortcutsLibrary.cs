@@ -1,13 +1,16 @@
 using Playnite.SDK;
+using Playnite.SDK.Events;
 using Playnite.SDK.Models;
 using Playnite.SDK.Plugins;
 
 namespace SteamShortcutsImporter;
 
-public class ShortcutsLibrary : LibraryPlugin
+internal sealed class ShortcutsLibrary
 {
     private static readonly ILogger Logger = LogManager.GetLogger();
     private static ShortcutsLibrary? Instance;
+    internal IPlayniteAPI PlayniteApi { get; }
+    private readonly Plugin _plugin;
 
     public readonly PluginSettings Settings;
     private readonly Guid pluginId = Guid.Parse(Constants.PluginId);
@@ -16,10 +19,13 @@ public class ShortcutsLibrary : LibraryPlugin
     private readonly SelectionDialogBuilder _dialogBuilder;
     private readonly BackupManager _backupManager;
     private readonly ImportExportService _importExportService;
+    private readonly AutoSyncHandler _autoSyncHandler;
     private readonly WriteBackHandler _writeBackHandler;
 
-    public ShortcutsLibrary(IPlayniteAPI api) : base(api)
+    public ShortcutsLibrary(IPlayniteAPI api, Plugin plugin)
     {
+        PlayniteApi = api;
+        _plugin = plugin;
         Instance = this;
         _artworkManager = new ArtworkManager(api);
         _dialogBuilder = new SelectionDialogBuilder(api, Logger, Name);
@@ -27,33 +33,81 @@ public class ShortcutsLibrary : LibraryPlugin
         
         try
         {
-            Settings = new PluginSettings(this);
+            Settings = new PluginSettings(_plugin);
             _pathResolver = new SteamPathResolver(Settings.SteamRootPath);
         }
         catch (Exception ex)
         {
             Logger.Error(ex, "Failed to initialize plugin settings.");
-            Settings = new PluginSettings(this) { SteamRootPath = string.Empty };
+            Settings = new PluginSettings(_plugin) { SteamRootPath = string.Empty };
             _pathResolver = new SteamPathResolver(Settings.SteamRootPath);
         }
 
         _importExportService = new ImportExportService(this, _artworkManager, _pathResolver, _dialogBuilder, _backupManager);
+        _autoSyncHandler = new AutoSyncHandler(Logger, PlayniteApi, this, _pathResolver, _artworkManager, _importExportService, _backupManager, Settings);
         _writeBackHandler = new WriteBackHandler(Logger, PlayniteApi, pluginId, _pathResolver, _artworkManager, _importExportService, Settings);
     }
 
-    public override void Dispose()
+    public void Dispose()
     {
+        _autoSyncHandler?.Dispose();
         _writeBackHandler?.Dispose();
-        base.Dispose();
+        if (ReferenceEquals(Instance, this))
+        {
+            Instance = null;
+        }
     }
 
-    public override Guid Id => pluginId;
+    public void OnLibraryUpdated(OnLibraryUpdatedEventArgs args)
+    {
+        _autoSyncHandler?.OnLibraryUpdated();
+    }
 
-    public override string Name => Constants.PluginName;
+    public void OnApplicationStopped(OnApplicationStoppedEventArgs args)
+    {
+        _autoSyncHandler?.OnApplicationStopped();
+    }
 
-    public override ISettings GetSettings(bool firstRunSettings) => Settings;
+    internal static void NotifySettingsSaved()
+    {
+        Instance?._autoSyncHandler?.OnSettingsChanged();
+    }
 
-    public override System.Windows.Controls.UserControl GetSettingsView(bool firstRunSettings)
+    internal static string GetAutomaticSyncStatus()
+    {
+        return Instance?._autoSyncHandler?.GetStatusText() ?? "Automatic sync is not initialized.";
+    }
+
+    internal static int RetryAutomaticSync()
+    {
+        return Instance?._autoSyncHandler?.RetryAllRecoverable() ?? 0;
+    }
+
+    internal static int ReconcileAutomaticSync()
+    {
+        return Instance?._autoSyncHandler?.ReconcileNow() ?? 0;
+    }
+
+    internal bool IsInitialAutoSyncBaselineComplete => _autoSyncHandler?.IsInitialBaselineCompleted ?? false;
+
+    internal void RecordSuccessfulExports(IEnumerable<ExportedShortcut> exports, bool establishInitialBaseline)
+    {
+        _autoSyncHandler.RecordManualExports(exports, establishInitialBaseline);
+    }
+
+    internal sealed class ExportedShortcut
+    {
+        public Game Game { get; set; } = null!;
+        public SteamShortcut Shortcut { get; set; } = null!;
+    }
+
+    public Guid Id => pluginId;
+
+    public string Name => Constants.PluginName;
+
+    public ISettings GetSettings(bool firstRunSettings) => Settings;
+
+    public System.Windows.Controls.UserControl GetSettingsView(bool firstRunSettings)
     {
         var view = new PluginSettingsView(PlayniteApi) { DataContext = Settings };
         return view;
@@ -63,6 +117,10 @@ public class ShortcutsLibrary : LibraryPlugin
     {
         return _backupManager.GetBackupRootDir();
     }
+
+    internal string GetPluginUserDataPath() => _plugin.GetPluginUserDataPath();
+
+    internal void SavePluginSettings(PluginSettings settings) => _plugin.SaveSettings(settings);
 
     internal static string? TryGetBackupRootStatic()
     {
@@ -217,7 +275,7 @@ public class ShortcutsLibrary : LibraryPlugin
         return Instance?.PlayniteApi;
     }
 
-    public override IEnumerable<MainMenuItem> GetMainMenuItems(GetMainMenuItemsArgs args)
+    public IEnumerable<MainMenuItem> GetMainMenuItems(GetMainMenuItemsArgs args)
     {
         yield return new MainMenuItem
         {
@@ -233,7 +291,7 @@ public class ShortcutsLibrary : LibraryPlugin
         };
     }
 
-    public override IEnumerable<GameMenuItem> GetGameMenuItems(GetGameMenuItemsArgs args)
+    public IEnumerable<GameMenuItem> GetGameMenuItems(GetGameMenuItemsArgs args)
     {
         if (args.Games?.Any() == true)
         {
@@ -309,7 +367,7 @@ public class ShortcutsLibrary : LibraryPlugin
     }
 
     
-    public override IEnumerable<GameMetadata> GetGames(LibraryGetGamesArgs args)
+    public IEnumerable<GameMetadata> GetGames(LibraryGetGamesArgs args)
     {
         var vdfPath = _pathResolver.ResolveShortcutsVdfPathForUser(Settings.SelectedSteamUserId);
         if (string.IsNullOrWhiteSpace(vdfPath) || !File.Exists(vdfPath))

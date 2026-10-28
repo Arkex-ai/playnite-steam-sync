@@ -9,6 +9,7 @@ artifacts/
 artifact/
 .dotnet/
 .nuget/
+tools/*.pext
 
 # VS/VSCode
 .vs/

@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Generic;
 using System.IO;
 using System.Linq;
 using Xunit;
@@ -235,5 +236,73 @@ public class ArtworkManagerTests
         var bases = ArtworkManager.GetExportTargets(game, appId).Select(t => t.TargetBase).ToList();
 
         Assert.Equal(new[] { "42", "42p", "42_icon", "42_logo", "42_hero" }, bases);
+    }
+
+    [Fact]
+    public void TrySynchronizeArtworkAsset_VerifiesAndRepeatsWithoutRewritingOrBackingUpAgain()
+    {
+        var root = Path.Combine(Path.GetTempPath(), "art_sync_test_" + Guid.NewGuid().ToString("N"));
+        var grid = Path.Combine(root, "grid");
+        var source = Path.Combine(root, "source.jpg");
+        var destination = Path.Combine(grid, "42.jpg");
+        var backups = new List<byte[]>();
+        try
+        {
+            Directory.CreateDirectory(grid);
+            File.WriteAllText(source, "updated-artwork");
+            File.WriteAllText(destination, "previous-artwork");
+            bool Backup(string path)
+            {
+                backups.Add(File.ReadAllBytes(path));
+                return true;
+            }
+
+            Assert.True(ArtworkManager.TrySynchronizeArtworkAsset(source, grid, "42", Backup));
+            Assert.Equal("updated-artwork", File.ReadAllText(destination));
+            Assert.Equal(new[] { "previous-artwork" }, backups.Select(bytes => System.Text.Encoding.UTF8.GetString(bytes)));
+            var writtenTime = File.GetLastWriteTimeUtc(destination);
+
+            Assert.True(ArtworkManager.TrySynchronizeArtworkAsset(source, grid, "42", Backup));
+
+            Assert.Equal(writtenTime, File.GetLastWriteTimeUtc(destination));
+            Assert.Single(backups);
+            Assert.Single(Directory.GetFiles(grid));
+        }
+        finally
+        {
+            if (Directory.Exists(root)) Directory.Delete(root, recursive: true);
+        }
+    }
+
+    [Fact]
+    public void TrySynchronizeArtworkAsset_ExtensionChangeBacksUpAndRemovesStaleGridVariant()
+    {
+        var root = Path.Combine(Path.GetTempPath(), "art_ext_sync_test_" + Guid.NewGuid().ToString("N"));
+        var grid = Path.Combine(root, "grid");
+        var source = Path.Combine(root, "source.png");
+        var stale = Path.Combine(grid, "42.jpg");
+        var backups = new List<byte[]>();
+        try
+        {
+            Directory.CreateDirectory(grid);
+            File.WriteAllText(source, "new-png-artwork");
+            File.WriteAllText(stale, "old-jpg-artwork");
+            bool Backup(string path)
+            {
+                backups.Add(File.ReadAllBytes(path));
+                return true;
+            }
+
+            Assert.True(ArtworkManager.TrySynchronizeArtworkAsset(source, grid, "42", Backup));
+
+            Assert.False(File.Exists(stale));
+            Assert.Equal("new-png-artwork", File.ReadAllText(Path.Combine(grid, "42.png")));
+            Assert.Equal(new[] { "old-jpg-artwork" }, backups.Select(bytes => System.Text.Encoding.UTF8.GetString(bytes)));
+            Assert.Single(Directory.GetFiles(grid));
+        }
+        finally
+        {
+            if (Directory.Exists(root)) Directory.Delete(root, recursive: true);
+        }
     }
 }

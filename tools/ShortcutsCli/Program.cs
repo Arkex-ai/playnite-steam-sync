@@ -60,9 +60,14 @@ internal class Program
         foreach (var s in items)
         {
             Console.WriteLine($"- {s.AppName}");
+            Console.WriteLine($"  appid: {s.AppId}");
+            Console.WriteLine($"  rungameid: {Utils.ToShortcutGameId(s.AppId)}");
             Console.WriteLine($"  exe: {s.Exe}");
             Console.WriteLine($"  dir: {s.StartDir}");
             Console.WriteLine($"  args: {s.LaunchOptions}");
+            Console.WriteLine($"  allowDesktopConfig: {s.AllowDesktopConfig}");
+            Console.WriteLine($"  allowOverlay: {s.AllowOverlay}");
+            Console.WriteLine($"  openVR: {s.OpenVR}");
             if (s.Tags?.Any() == true)
             {
                 Console.WriteLine($"  tags: {string.Join(", ", s.Tags)}");

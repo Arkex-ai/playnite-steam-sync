@@ -23,8 +23,9 @@ internal class SteamPathResolver
 
     /// <summary>
     /// Resolves the path to the shortcuts.vdf file for the current Steam installation.
-    /// Searches through all user directories and returns the first valid shortcuts.vdf found.
-    /// If no shortcuts.vdf exists, returns a path for creation in the first valid user directory.
+    /// Uses Steam's unique MostRecent account when available. Without that marker, it only
+    /// selects a profile when exactly one existing shortcuts.vdf or userdata profile is found.
+    /// Ambiguous profiles fail closed instead of depending on filesystem enumeration order.
     /// </summary>
     public string? ResolveShortcutsVdfPath()
     {
@@ -42,28 +43,55 @@ internal class SteamPathResolver
                 return null;
             }
 
-            string? firstValidUserDir = null;
-            foreach (var userDir in Directory.EnumerateDirectories(userdata))
+            var mostRecentUserId = SteamUsersReader.GetMostRecentUserId(root);
+            if (!string.IsNullOrWhiteSpace(mostRecentUserId))
             {
-                var dirName = Path.GetFileName(userDir);
-                // Track first valid user directory (numeric folder name)
-                if (firstValidUserDir == null && !string.IsNullOrEmpty(dirName) && dirName.All(char.IsDigit))
+                if (!Utils.TryConvertSteamId64ToUserDataId(mostRecentUserId, out var accountId))
                 {
-                    firstValidUserDir = userDir;
+                    accountId = mostRecentUserId;
                 }
 
-                var cfg = Path.Combine(userDir, Constants.ConfigDirectory, "shortcuts.vdf");
-                if (File.Exists(cfg))
+                var activeUserDir = Path.Combine(userdata, accountId);
+                if (Directory.Exists(activeUserDir))
                 {
-                    return cfg;
+                    return Path.Combine(activeUserDir, Constants.ConfigDirectory, "shortcuts.vdf");
                 }
+
+                Logger.Warn($"Steam's most recent userdata profile is missing: {activeUserDir}");
+                return null;
             }
 
-            // No shortcuts.vdf found - return path for creation in first valid user directory
-            if (firstValidUserDir != null)
+            var userDirectories = Directory.EnumerateDirectories(userdata)
+                .Where(userDir =>
+                {
+                    var dirName = Path.GetFileName(userDir);
+                    return !string.IsNullOrEmpty(dirName) && dirName != "0" && dirName.All(char.IsDigit);
+                })
+                .ToList();
+            var existingVdfs = userDirectories
+                .Select(userDir => Path.Combine(userDir, Constants.ConfigDirectory, "shortcuts.vdf"))
+                .Where(File.Exists)
+                .ToList();
+
+            if (existingVdfs.Count == 1)
             {
-                var configDir = Path.Combine(firstValidUserDir, Constants.ConfigDirectory);
-                return Path.Combine(configDir, "shortcuts.vdf");
+                return existingVdfs[0];
+            }
+
+            if (existingVdfs.Count > 1)
+            {
+                Logger.Warn("Multiple Steam profiles have shortcuts.vdf and loginusers.vdf has no unique MostRecent account.");
+                return null;
+            }
+
+            if (userDirectories.Count == 1)
+            {
+                return Path.Combine(userDirectories[0], Constants.ConfigDirectory, "shortcuts.vdf");
+            }
+
+            if (userDirectories.Count > 1)
+            {
+                Logger.Warn("Multiple Steam userdata profiles exist and loginusers.vdf has no unique MostRecent account.");
             }
         }
         catch (Exception ex)
@@ -76,16 +104,22 @@ internal class SteamPathResolver
 
     /// <summary>
     /// Resolves the path to shortcuts.vdf for a specific Steam user.
-    /// If userId is null or empty, falls back to the first valid shortcuts.vdf found.
+    /// If userId is null or empty, uses the auto-detection rules.
     /// </summary>
     /// <param name="userId">The Steam user ID (numeric folder name in userdata).</param>
     /// <returns>Path to shortcuts.vdf, or null if not found.</returns>
     public string? ResolveShortcutsVdfPathForUser(string? userId)
     {
-        // If no specific user, use default behavior (first found)
+        // If no specific user, use deterministic auto-detection.
         if (string.IsNullOrWhiteSpace(userId))
         {
             return ResolveShortcutsVdfPath();
+        }
+
+        if (userId == "0" || userId.Any(character => !char.IsDigit(character)))
+        {
+            Logger.Warn("Selected Steam user ID is not a valid numeric account identifier.");
+            return null;
         }
 
         try
@@ -118,14 +152,50 @@ internal class SteamPathResolver
                 return vdfPath;
             }
 
-            // User directory doesn't exist - fall back to auto-detect
-            Logger.Warn($"Selected user directory not found: {userDir}. Falling back to auto-detect.");
-            return ResolveShortcutsVdfPath();
+            // Never redirect an explicit profile selection to another user's shortcuts.vdf.
+            Logger.Warn($"Selected user directory not found: {userDir}.");
+            return null;
         }
         catch (Exception ex)
         {
             Logger.Error(ex, $"Failed to resolve shortcuts.vdf path for user {userId}.");
-            return ResolveShortcutsVdfPath();
+            return null;
+        }
+    }
+
+    /// <summary>
+    /// Returns the Steam ID associated with the auto-detected shortcuts profile.
+    /// A user selected in settings takes precedence; this method is only for auto-detect mode.
+    /// </summary>
+    public string? ResolveAutoDetectedSteamUserId()
+    {
+        var vdfPath = ResolveShortcutsVdfPath();
+        if (string.IsNullOrWhiteSpace(vdfPath)) return null;
+
+        try
+        {
+            var recentUserId = SteamUsersReader.GetMostRecentUserId(_steamRootPath);
+            var userDataFolder = Directory.GetParent(Path.GetDirectoryName(vdfPath)!)?.Name;
+            if (string.IsNullOrWhiteSpace(userDataFolder)) return null;
+
+            if (!string.IsNullOrWhiteSpace(recentUserId))
+            {
+                var recentFolder = Utils.TryConvertSteamId64ToUserDataId(recentUserId, out var accountId)
+                    ? accountId
+                    : recentUserId;
+                return string.Equals(userDataFolder, recentFolder, StringComparison.OrdinalIgnoreCase)
+                    ? recentUserId
+                    : null;
+            }
+
+            return Utils.TryConvertUserDataIdToSteamId64(userDataFolder, out var steamId64)
+                ? steamId64
+                : userDataFolder;
+        }
+        catch (Exception ex)
+        {
+            Logger.Warn(ex, "Failed to resolve the Steam account for auto-detect mode.");
+            return null;
         }
     }
 
@@ -174,6 +244,25 @@ internal class SteamPathResolver
     }
 
     /// <summary>
+    /// Expands variables in launch arguments without resolving the argument string as a path.
+    /// Arguments commonly start with flags (for example, Playnite's --start CLI options) and
+    /// must not be combined with the game's install directory.
+    /// </summary>
+    public string? ExpandArgumentVariables(Game game, string? input)
+    {
+        if (string.IsNullOrWhiteSpace(input)) return input;
+
+        var result = input ?? string.Empty;
+        var installDirectory = game.InstallDirectory;
+        if (!string.IsNullOrEmpty(installDirectory))
+        {
+            result = result.Replace("{InstallDir}", installDirectory!);
+        }
+
+        return Environment.ExpandEnvironmentVariables(result);
+    }
+
+    /// <summary>
     /// Parses a Steam rungameid URL and extracts the AppId.
     /// </summary>
     public static uint TryParseAppIdFromRungameUrl(string? url)
@@ -209,6 +298,7 @@ internal class SteamPathResolver
         "crash*", "crashreport*", "crashhandler*",
         "update*", "updater*",
         "setup*", "install*",
+        "gamelaunchhelper*",
         "launcher*", "launch*",
         "UnityCrashHandler*", "UE4PrereqSetup*", "UEPrereqSetup*",
         "vcredist*", "vc_redist*",

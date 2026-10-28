@@ -17,6 +17,22 @@ internal static class EmulatorPathUtils
         @"(?<=[^\\/""\s])\\{2,}",
         RegexOptions.Compiled);
 
+    private static readonly Regex PlayniteGameVariableRegex = new Regex(
+        @"\{(?:InstallDir|InstallDirName|ImagePath|ImageName|ImageNameNoExt|ImageDir|PlayniteDir|Name|Platform|GameId|DatabaseId|PluginId|Version|EmulatorDir)\}",
+        RegexOptions.Compiled | RegexOptions.IgnoreCase);
+
+    public static string? FindUnexpandedGameVariable(params string?[] values)
+    {
+        foreach (var value in values)
+        {
+            if (string.IsNullOrEmpty(value)) continue;
+            var match = PlayniteGameVariableRegex.Match(value);
+            if (match.Success) return match.Value;
+        }
+
+        return null;
+    }
+
     /// <summary>
     /// Normalizes path separators by collapsing consecutive backslashes to a single backslash.
     /// Preserves UNC path prefixes (\\server\share) at the start of path segments.

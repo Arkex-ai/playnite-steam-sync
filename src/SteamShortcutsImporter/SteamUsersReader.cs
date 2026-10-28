@@ -14,6 +14,7 @@ public class SteamUserAccount
     public string UserId { get; set; } = string.Empty;
     public string AccountName { get; set; } = string.Empty;
     public string PersonaName { get; set; } = string.Empty;
+    public bool MostRecent { get; set; }
     /// <summary>
     /// Display name prioritizes: PersonaName (Steam display name) > AccountName (login name) > fallback.
     /// </summary>
@@ -30,6 +31,15 @@ public class SteamUserAccount
 internal static class SteamUsersReader
 {
     private static readonly ILogger Logger = LogManager.GetLogger();
+    private static readonly object CacheLock = new object();
+    private static readonly Dictionary<string, CachedUserFile> UserFileCache = new Dictionary<string, CachedUserFile>(StringComparer.OrdinalIgnoreCase);
+
+    private sealed class CachedUserFile
+    {
+        public long Length { get; set; }
+        public DateTime LastWriteTimeUtc { get; set; }
+        public Dictionary<string, SteamUserAccount> Users { get; set; } = new Dictionary<string, SteamUserAccount>(StringComparer.Ordinal);
+    }
 
     /// <summary>
     /// Reads loginusers.vdf and returns a mapping of userId to AccountName.
@@ -38,33 +48,95 @@ internal static class SteamUsersReader
     /// <returns>Dictionary mapping Steam user IDs to account info.</returns>
     public static Dictionary<string, SteamUserAccount> ReadUsers(string? steamRootPath)
     {
-        var result = new Dictionary<string, SteamUserAccount>(StringComparer.Ordinal);
-
-        if (string.IsNullOrWhiteSpace(steamRootPath))
-        {
-            return result;
-        }
-
-        var loginusersPath = Path.Combine(steamRootPath, "config", "loginusers.vdf");
-        if (!File.Exists(loginusersPath))
-        {
-            Logger.Debug($"loginusers.vdf not found at {loginusersPath}");
-            return result;
-        }
-
         try
         {
-            // Read with UTF-8 BOM detection
-            var content = File.ReadAllText(loginusersPath, Encoding.UTF8);
-            ParseLoginUsers(content, result);
-            Logger.Debug($"Read {result.Count} user(s) from loginusers.vdf");
+            if (string.IsNullOrWhiteSpace(steamRootPath)) return new Dictionary<string, SteamUserAccount>(StringComparer.Ordinal);
+
+            var loginusersPath = Path.GetFullPath(Path.Combine(steamRootPath, "config", "loginusers.vdf"));
+            lock (CacheLock)
+            {
+                if (!File.Exists(loginusersPath))
+                {
+                    if (UserFileCache.TryGetValue(loginusersPath, out var missing) && missing.Length == -1)
+                    {
+                        return CloneUsers(missing.Users);
+                    }
+
+                    Logger.Debug($"loginusers.vdf not found at {loginusersPath}");
+                    UserFileCache[loginusersPath] = new CachedUserFile { Length = -1, LastWriteTimeUtc = DateTime.MinValue };
+                    return new Dictionary<string, SteamUserAccount>(StringComparer.Ordinal);
+                }
+
+                var fileInfo = new FileInfo(loginusersPath);
+                var length = fileInfo.Length;
+                var lastWriteTimeUtc = fileInfo.LastWriteTimeUtc;
+                if (UserFileCache.TryGetValue(loginusersPath, out var cached) &&
+                    cached.Length == length && cached.LastWriteTimeUtc == lastWriteTimeUtc)
+                {
+                    return CloneUsers(cached.Users);
+                }
+
+                var result = new Dictionary<string, SteamUserAccount>(StringComparer.Ordinal);
+                try
+                {
+                    // Read with UTF-8 BOM detection.
+                    var content = File.ReadAllText(loginusersPath, Encoding.UTF8);
+                    ParseLoginUsers(content, result);
+                }
+                catch (Exception ex)
+                {
+                    Logger.Error(ex, $"Failed to read loginusers.vdf at {loginusersPath}");
+                }
+
+                UserFileCache[loginusersPath] = new CachedUserFile
+                {
+                    Length = length,
+                    LastWriteTimeUtc = lastWriteTimeUtc,
+                    Users = result
+                };
+                Logger.Debug($"Read {result.Count} user(s) from loginusers.vdf");
+                return CloneUsers(result);
+            }
         }
         catch (Exception ex)
         {
-            Logger.Error(ex, $"Failed to read loginusers.vdf at {loginusersPath}");
+            Logger.Error(ex, $"Failed to resolve Steam loginusers.vdf under '{steamRootPath}'.");
+            return new Dictionary<string, SteamUserAccount>(StringComparer.Ordinal);
+        }
+    }
+
+    private static Dictionary<string, SteamUserAccount> CloneUsers(Dictionary<string, SteamUserAccount> users)
+    {
+        var clone = new Dictionary<string, SteamUserAccount>(StringComparer.Ordinal);
+        foreach (var pair in users)
+        {
+            clone[pair.Key] = new SteamUserAccount
+            {
+                UserId = pair.Value.UserId,
+                AccountName = pair.Value.AccountName,
+                PersonaName = pair.Value.PersonaName,
+                MostRecent = pair.Value.MostRecent
+            };
+        }
+        return clone;
+    }
+
+    /// <summary>
+    /// Returns the unique Steam account marked as most recent in loginusers.vdf.
+    /// Ambiguous or missing markers return null so callers do not guess a profile.
+    /// </summary>
+    public static string? GetMostRecentUserId(string? steamRootPath)
+    {
+        var recentUsers = new List<string>();
+        foreach (var account in ReadUsers(steamRootPath).Values)
+        {
+            if (account.MostRecent && !string.IsNullOrWhiteSpace(account.UserId))
+            {
+                recentUsers.Add(account.UserId);
+            }
         }
 
-        return result;
+        return recentUsers.Count == 1 ? recentUsers[0] : null;
     }
 
     /// <summary>
@@ -185,6 +257,10 @@ internal static class SteamUsersReader
                 else if (string.Equals(key, "PersonaName", StringComparison.OrdinalIgnoreCase))
                 {
                     currentUser.PersonaName = value ?? string.Empty;
+                }
+                else if (string.Equals(key, "MostRecent", StringComparison.OrdinalIgnoreCase))
+                {
+                    currentUser.MostRecent = string.Equals(value, "1", StringComparison.Ordinal);
                 }
             }
         }

@@ -1,6 +1,7 @@
 Param(
     [string]$Configuration = 'Release',
-    [string]$PlayniteVersion = '10.32'
+    [string]$PlayniteVersion = '10.63',
+    [string]$ToolboxPath = ''
 )
 
 $ErrorActionPreference = 'Stop'
@@ -16,26 +17,36 @@ if (Test-Path (Join-Path $PSScriptRoot '..\src\SteamShortcutsImporter\icon.png')
     Copy-Item (Join-Path $PSScriptRoot '..\src\SteamShortcutsImporter\icon.png') $outDir -Force
 }
 
-$tmp = Join-Path $env:TEMP "Playnite-$PlayniteVersion"
-if (!(Test-Path (Join-Path $tmp 'Toolbox.exe'))) {
-    $zipUrl = "https://github.com/JosefNemec/Playnite/releases/download/$PlayniteVersion/Playnite-$PlayniteVersion.zip"
-    $zipPath = Join-Path $env:TEMP "Playnite-$PlayniteVersion.zip"
-    Invoke-WebRequest -Uri $zipUrl -OutFile $zipPath
-    New-Item -ItemType Directory -Force -Path $tmp | Out-Null
-    Expand-Archive -Path $zipPath -DestinationPath $tmp -Force
+$toolboxCandidates = @()
+if (![string]::IsNullOrWhiteSpace($ToolboxPath)) {
+    $toolboxCandidates += $ToolboxPath
 }
+$toolboxCandidates += @(
+    (Join-Path $env:LOCALAPPDATA 'Playnite\Toolbox.exe'),
+    (Join-Path $env:ProgramFiles 'Playnite\Toolbox.exe'),
+    (Join-Path ${env:ProgramFiles(x86)} 'Playnite\Toolbox.exe'),
+    (Join-Path $env:TEMP "Playnite-$PlayniteVersion\Toolbox.exe")
+)
 
-$toolbox = Join-Path $tmp 'Toolbox.exe'
-if (!(Test-Path $toolbox)) { throw "Toolbox.exe not found: $toolbox" }
+$toolbox = $toolboxCandidates | Where-Object { Test-Path -LiteralPath $_ } | Select-Object -First 1
+if (!$toolbox) {
+    throw "Toolbox.exe not found. Install Playnite $PlayniteVersion or pass -ToolboxPath with a compatible Toolbox.exe."
+}
 
 Push-Location $outDir
 try {
-    if (Test-Path 'SteamShortcutsImporter.pext') { Remove-Item 'SteamShortcutsImporter.pext' -Force }
-    & $toolbox pack $outDir $PSScriptRoot
+    $packOutput = & $toolbox pack $outDir $PSScriptRoot
+    $packOutput | ForEach-Object { Write-Host $_ }
+    $packedLine = $packOutput | Where-Object { $_ -match 'successfully packed as "(.+\.pext)"' } | Select-Object -First 1
+    $packMatch = [regex]::Match([string]$packedLine, 'successfully packed as "(.+\.pext)"')
+    if (!$packMatch.Success) {
+        throw "Toolbox did not report the generated .pext path."
+    }
+    $packedPath = $packMatch.Groups[1].Value
 }
 finally {
     Pop-Location
 }
 
-Write-Host "Packed: " (Join-Path $PSScriptRoot 'SteamShortcutsImporter.pext')
+Write-Host "Packed: " $packedPath
 

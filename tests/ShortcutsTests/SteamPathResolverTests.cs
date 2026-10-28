@@ -34,7 +34,7 @@ public class SteamPathResolverTests
     }
 
     [Fact]
-    public void ResolveShortcutsVdfPath_MultipleUsers_ReturnsFirstValid()
+    public void ResolveShortcutsVdfPath_MultipleUsersWithoutLoginMarker_ReturnsOnlyExistingVdf()
     {
         var tempRoot = Path.Combine(Path.GetTempPath(), "steam_test_" + Guid.NewGuid().ToString("N"));
         try
@@ -54,6 +54,42 @@ public class SteamPathResolverTests
 
             Assert.NotNull(result);
             Assert.True(File.Exists(result));
+        }
+        finally
+        {
+            if (Directory.Exists(tempRoot))
+                Directory.Delete(tempRoot, recursive: true);
+        }
+    }
+
+    [Fact]
+    public void ResolveShortcutsVdfPath_PrefersMostRecentSteamUser()
+    {
+        var tempRoot = Path.Combine(Path.GetTempPath(), "steam_test_" + Guid.NewGuid().ToString("N"));
+        try
+        {
+            const string recentSteamId = "76561197960265729";
+            const string olderSteamId = "76561197960265730";
+            Assert.True(Utils.TryConvertSteamId64ToUserDataId(recentSteamId, out var recentFolder));
+            Assert.True(Utils.TryConvertSteamId64ToUserDataId(olderSteamId, out var olderFolder));
+
+            var recentConfig = Path.Combine(tempRoot, "userdata", recentFolder, "config");
+            var olderConfig = Path.Combine(tempRoot, "userdata", olderFolder, "config");
+            Directory.CreateDirectory(recentConfig);
+            Directory.CreateDirectory(olderConfig);
+            File.WriteAllText(Path.Combine(recentConfig, "shortcuts.vdf"), "recent");
+            File.WriteAllText(Path.Combine(olderConfig, "shortcuts.vdf"), "older");
+
+            var steamConfig = Path.Combine(tempRoot, "config");
+            Directory.CreateDirectory(steamConfig);
+            var loginusersContent = "\"users\"\n{\n\t\"" + recentSteamId + "\"\n\t{\n\t\t\"MostRecent\"\t\t\"1\"\n\t}\n\t\"" + olderSteamId + "\"\n\t{\n\t\t\"MostRecent\"\t\t\"0\"\n\t}\n}";
+            File.WriteAllText(Path.Combine(steamConfig, "loginusers.vdf"), loginusersContent);
+
+            var resolver = new SteamPathResolver(tempRoot);
+            var result = resolver.ResolveShortcutsVdfPath();
+
+            Assert.Equal(Path.Combine(recentConfig, "shortcuts.vdf"), result);
+            Assert.Equal(recentSteamId, resolver.ResolveAutoDetectedSteamUserId());
         }
         finally
         {
@@ -227,6 +263,32 @@ public class SteamPathResolverTests
 
         Assert.DoesNotContain("\"", result ?? string.Empty);
         Assert.Contains("TestGame", result);
+    }
+
+    [Fact]
+    public void ExpandArgumentVariables_DoesNotResolveFlagsAgainstInstallDirectory()
+    {
+        var game = new Game("Test Game")
+        {
+            InstallDirectory = @"C:\Program Files\WindowsApps\TestPackage"
+        };
+        var resolver = new SteamPathResolver(null);
+        var arguments = "--start 3415f599-c59d-4ae2-a974-d8941f4fffc8 --actionindex 0 --nolibupdate";
+
+        Assert.Equal(arguments, resolver.ExpandArgumentVariables(game, arguments));
+    }
+
+    [Fact]
+    public void ExpandArgumentVariables_ReplacesInstallDirWithoutNormalizingTheCommandLine()
+    {
+        var game = new Game("Test Game")
+        {
+            InstallDirectory = @"C:\Games\Test Game"
+        };
+        var resolver = new SteamPathResolver(null);
+        var arguments = @"--rom ""{InstallDir}\Game.rom""";
+
+        Assert.Equal(@"--rom ""C:\Games\Test Game\Game.rom""", resolver.ExpandArgumentVariables(game, arguments));
     }
 
     [Fact]
@@ -749,7 +811,7 @@ public class SteamPathResolverTests
     }
 
     [Fact]
-    public void ResolveShortcutsVdfPathForUser_UserDirNotExist_FallsBackToAutoDetect()
+    public void ResolveShortcutsVdfPathForUser_UserDirNotExist_DoesNotFallBackToAnotherUser()
     {
         var tempRoot = Path.Combine(Path.GetTempPath(), "steam_test_" + Guid.NewGuid().ToString("N"));
         try
@@ -766,9 +828,7 @@ public class SteamPathResolverTests
             var resolver = new SteamPathResolver(tempRoot);
             var result = resolver.ResolveShortcutsVdfPathForUser("12345678901234567");
 
-            // Should fall back to auto-detect
-            Assert.NotNull(result);
-            Assert.Equal(fallbackVdf, result);
+            Assert.Null(result);
         }
         finally
         {
@@ -786,6 +846,27 @@ public class SteamPathResolverTests
         var result = resolver.ResolveShortcutsVdfPathForUser("12345678901234567");
 
         Assert.Null(result);
+    }
+
+    [Fact]
+    public void ResolveShortcutsVdfPathForUser_RejectsNonNumericUserId()
+    {
+        var tempRoot = Path.Combine(Path.GetTempPath(), "steam_test_" + Guid.NewGuid().ToString("N"));
+        try
+        {
+            var userDataDir = Path.Combine(tempRoot, "userdata", "12345", "config");
+            Directory.CreateDirectory(userDataDir);
+            File.WriteAllText(Path.Combine(userDataDir, "shortcuts.vdf"), "test");
+
+            var resolver = new SteamPathResolver(tempRoot);
+
+            Assert.Null(resolver.ResolveShortcutsVdfPathForUser("..\\12345"));
+        }
+        finally
+        {
+            if (Directory.Exists(tempRoot))
+                Directory.Delete(tempRoot, recursive: true);
+        }
     }
 
     #endregion

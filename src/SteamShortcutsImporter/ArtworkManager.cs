@@ -3,6 +3,7 @@ using System;
 using System.Collections.Generic;
 using System.IO;
 using System.Linq;
+using System.Security.Cryptography;
 
 namespace SteamShortcutsImporter;
 
@@ -40,33 +41,145 @@ internal class ArtworkManager
     /// <summary>
     /// Exports game artwork (cover, icon, background, plus a logo proxy) to the Steam grid folder.
     /// </summary>
-    public void TryExportArtworkToGrid(Playnite.SDK.Models.Game game, uint appId, string? gridDir)
+    public bool TryExportArtworkToGrid(Playnite.SDK.Models.Game game, uint appId, string? gridDir)
     {
-        if (appId == 0 || string.IsNullOrEmpty(gridDir)) return;
+        if (appId == 0 || string.IsNullOrEmpty(gridDir)) return false;
 
         try
         {
             Directory.CreateDirectory(gridDir);
+            var targets = GetExportTargets(game, appId).ToList();
+            if (targets.Count == 0) return true;
 
-            void CopyIfExists(string dbPath, string targetNameBase)
+            var configDir = Directory.GetParent(gridDir)?.FullName;
+            if (string.IsNullOrWhiteSpace(configDir)) return false;
+            var vdfPath = Path.Combine(configDir, "shortcuts.vdf");
+            var userId = BackupManager.TryGetSteamUserFromPath(vdfPath) ?? Constants.DefaultUserSegment;
+            var allSourcesSynchronized = true;
+
+            foreach (var (dbPath, targetBase) in targets)
             {
-                if (string.IsNullOrEmpty(dbPath)) return;
+                if (string.IsNullOrEmpty(dbPath)) continue;
                 var src = _playniteApi.Database.GetFullFilePath(dbPath);
-                if (string.IsNullOrEmpty(src) || !File.Exists(src)) return;
-                var ext = Path.GetExtension(src);
-                var dst = Path.Combine(gridDir!, targetNameBase + ext);
-                File.Copy(src, dst, overwrite: true);
+                if (string.IsNullOrEmpty(src) || !File.Exists(src))
+                {
+                    allSourcesSynchronized = false;
+                    continue;
+                }
+                if (!TrySynchronizeArtworkAsset(src, gridDir!, targetBase, existingPath =>
+                    BackupManager.TryCreateManagedArtworkBackupStatic(existingPath, userId, Path.GetFileName(existingPath), out _)))
+                {
+                    allSourcesSynchronized = false;
+                }
             }
-
-            foreach (var (source, targetBase) in GetExportTargets(game, appId))
-            {
-                CopyIfExists(source, targetBase);
-            }
+            return allSourcesSynchronized;
         }
         catch (Exception ex)
         {
             Logger.Warn(ex, $"Failed exporting artwork to grid for appId={appId}");
+            return false;
         }
+    }
+
+    internal static bool TrySynchronizeArtworkAsset(string sourcePath, string gridDir, string targetBase, Func<string, bool> backupExistingFile)
+    {
+        if (string.IsNullOrWhiteSpace(sourcePath) || !File.Exists(sourcePath) ||
+            string.IsNullOrWhiteSpace(gridDir) || string.IsNullOrWhiteSpace(targetBase) || backupExistingFile == null)
+        {
+            return false;
+        }
+
+        string? stagedPath = null;
+        try
+        {
+            Directory.CreateDirectory(gridDir);
+            var sourceHash = GetFileHash(sourcePath);
+            var extension = Path.GetExtension(sourcePath);
+            var destinationPath = Path.Combine(gridDir, targetBase + extension);
+            var existingVariants = GetTargetVariants(gridDir, targetBase);
+
+            if (File.Exists(destinationPath) && HashesMatch(sourceHash, GetFileHash(destinationPath)))
+            {
+                foreach (var stalePath in existingVariants.Where(path => !PathsEqual(path, destinationPath)))
+                {
+                    if (!backupExistingFile(stalePath)) return false;
+                    File.Delete(stalePath);
+                }
+
+                return HashesMatch(sourceHash, GetFileHash(sourcePath)) &&
+                    HashesMatch(sourceHash, GetFileHash(destinationPath));
+            }
+
+            stagedPath = Path.Combine(gridDir, ".nss-" + Guid.NewGuid().ToString("N") + ".tmp");
+            File.Copy(sourcePath, stagedPath, overwrite: false);
+            var copiedHash = GetFileHash(stagedPath);
+            if (!HashesMatch(sourceHash, copiedHash) || !HashesMatch(sourceHash, GetFileHash(sourcePath)))
+            {
+                return false;
+            }
+
+            foreach (var existingPath in existingVariants)
+            {
+                if (!backupExistingFile(existingPath)) return false;
+            }
+
+            if (File.Exists(destinationPath))
+            {
+                File.Replace(stagedPath, destinationPath, null, true);
+            }
+            else
+            {
+                File.Move(stagedPath, destinationPath);
+            }
+            stagedPath = null;
+
+            if (!HashesMatch(sourceHash, GetFileHash(sourcePath)) ||
+                !HashesMatch(sourceHash, GetFileHash(destinationPath)))
+            {
+                return false;
+            }
+
+            foreach (var stalePath in existingVariants.Where(path => !PathsEqual(path, destinationPath)))
+            {
+                if (File.Exists(stalePath)) File.Delete(stalePath);
+            }
+
+            return true;
+        }
+        catch (Exception ex)
+        {
+            Logger.Warn(ex, $"Failed to synchronize artwork asset '{sourcePath}' to slot '{targetBase}'.");
+            return false;
+        }
+        finally
+        {
+            try { if (!string.IsNullOrEmpty(stagedPath) && File.Exists(stagedPath)) File.Delete(stagedPath); }
+            catch (Exception ex) { Logger.Warn(ex, "Failed to remove an incomplete staged artwork file."); }
+        }
+    }
+
+    private static List<string> GetTargetVariants(string gridDir, string targetBase)
+    {
+        return Directory.GetFiles(gridDir, targetBase + ".*", SearchOption.TopDirectoryOnly)
+            .Where(path => string.Equals(Path.GetFileNameWithoutExtension(path), targetBase, StringComparison.OrdinalIgnoreCase))
+            .ToList();
+    }
+
+    private static bool PathsEqual(string left, string right)
+    {
+        return string.Equals(Path.GetFullPath(left), Path.GetFullPath(right), StringComparison.OrdinalIgnoreCase);
+    }
+
+    private static bool HashesMatch(string left, string right)
+    {
+        return string.Equals(left, right, StringComparison.OrdinalIgnoreCase);
+    }
+
+    private static string GetFileHash(string path)
+    {
+        using var sha = SHA256.Create();
+        using var stream = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete);
+        return BitConverter.ToString(sha.ComputeHash(stream)).Replace("-", string.Empty).ToLowerInvariant();
     }
 
     /// <summary>

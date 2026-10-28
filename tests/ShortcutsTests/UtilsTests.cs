@@ -8,12 +8,12 @@ public class UtilsTests
     [Fact]
     public void TryConvertUserDataIdToSteamId64_WithSteamId64_ReturnsSameValue()
     {
-        var input = "76561198051525001";
+        var input = "76561197960265729";
 
         var result = Utils.TryConvertUserDataIdToSteamId64(input, out var steamId64);
 
         Assert.True(result);
-        Assert.Equal("76561198051525001", steamId64);
+        Assert.Equal("76561197960265729", steamId64);
     }
 
     [Fact]
@@ -145,6 +145,15 @@ public class UtilsTests
         // Expected: (appId << 32) | 0x02000000
         ulong expected = ((ulong)appId << 32) | 0x02000000UL;
         Assert.Equal(expected, gameId);
+    }
+
+    [Fact]
+    public void ToShortcutGameId_RealSteamShortcutUses64BitGameId()
+    {
+        const uint appId = 2387725351u;
+        const ulong expectedGameId = 10255202294408675328UL;
+
+        Assert.Equal(expectedGameId, Utils.ToShortcutGameId(appId));
     }
 
     [Fact]

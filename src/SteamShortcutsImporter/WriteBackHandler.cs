@@ -22,7 +22,7 @@ internal class WriteBackHandler : IDisposable
     // Debouncing for Games_ItemUpdated to prevent race conditions
     private Timer? _updateDebounceTimer;
     private readonly object _updateLock = new object();
-    private bool _hasPendingUpdates = false;
+    private readonly Dictionary<Guid, Game> _pendingGames = new Dictionary<Guid, Game>();
     private const int UpdateDebounceMs = 2000; // 2 second delay after last update
 
     public WriteBackHandler(
@@ -58,6 +58,18 @@ internal class WriteBackHandler : IDisposable
 
     public void Dispose()
     {
+        try
+        {
+            if (_playniteApi?.Database?.Games != null)
+            {
+                _playniteApi.Database.Games.ItemUpdated -= Games_ItemUpdated;
+            }
+        }
+        catch (Exception ex)
+        {
+            _logger.Warn(ex, "Failed to detach Games.ItemUpdated handler.");
+        }
+
         // Thread-safe cleanup of debounce timer using Interlocked.Exchange
         var timer = Interlocked.Exchange(ref _updateDebounceTimer, null);
         timer?.Dispose();
@@ -65,11 +77,22 @@ internal class WriteBackHandler : IDisposable
 
     private void Games_ItemUpdated(object sender, ItemUpdatedEventArgs<Game> e)
     {
+        if (e?.UpdatedItems == null) return;
+
         // Debounce updates to prevent race conditions when multiple games change rapidly
         // This queues a write operation that executes after UpdateDebounceMs of idle time
         lock (_updateLock)
         {
-            _hasPendingUpdates = true;
+            foreach (var update in e.UpdatedItems)
+            {
+                var game = update?.NewData;
+                if (game != null && game.PluginId == _pluginId && game.Id != Guid.Empty)
+                {
+                    _pendingGames[game.Id] = game;
+                }
+            }
+
+            if (_pendingGames.Count == 0) return;
             
             // Thread-safe timer replacement - dispose old timer and create new one atomically
             var newTimer = new Timer(_ => ProcessPendingGameUpdates(), null, UpdateDebounceMs, Timeout.Infinite);
@@ -80,14 +103,16 @@ internal class WriteBackHandler : IDisposable
     
     private void ProcessPendingGameUpdates()
     {
+        List<Game> updatedGames;
         lock (_updateLock)
         {
-            if (!_hasPendingUpdates)
+            if (_pendingGames.Count == 0)
             {
                 return;
             }
-            
-            _hasPendingUpdates = false;
+
+            updatedGames = _pendingGames.Values.ToList();
+            _pendingGames.Clear();
         }
         
         // Persist all pending changes from Playnite back to shortcuts.vdf
@@ -96,9 +121,17 @@ internal class WriteBackHandler : IDisposable
             var vdfPath = _pathResolver.ResolveShortcutsVdfPathForUser(_settings.SelectedSteamUserId);
             if (string.IsNullOrWhiteSpace(vdfPath) || !File.Exists(vdfPath))
             {
+                Requeue(updatedGames, 5000);
                 return;
             }
 
+            if (!SteamProcessHelper.TryIsSteamRunning(out var steamRunning) || steamRunning)
+            {
+                Requeue(updatedGames, 5000);
+                return;
+            }
+
+            var sourceFingerprint = ShortcutsFile.GetFileFingerprint(vdfPath!);
             var shortcuts = ShortcutsFile.Read(vdfPath!).ToList();
             // Use GroupBy to handle duplicates safely (keep first occurrence)
             var stableGroups = shortcuts.GroupBy(s => s.StableId, StringComparer.OrdinalIgnoreCase).ToList();
@@ -109,9 +142,7 @@ internal class WriteBackHandler : IDisposable
             var byApp = appGroups.ToDictionary(g => g.Key, g => g.First(), StringComparer.OrdinalIgnoreCase);
             bool changed = false;
 
-            // Check all games from this library and sync any that changed
-            var ourGames = _playniteApi?.Database?.Games?.Where(g => g.PluginId == _pluginId)?.ToList() ?? new List<Game>();
-            foreach (var game in ourGames)
+            foreach (var game in updatedGames)
             {
                 SteamShortcut? sc = null;
                 var gid = game.GameId ?? string.Empty;
@@ -135,27 +166,39 @@ internal class WriteBackHandler : IDisposable
 
             if (changed)
             {
-                _logger.Info($"Writing debounced updates to shortcuts.vdf for {ourGames.Count} game(s).");
-                _importExportService.WriteShortcutsWithBackup(vdfPath!, shortcuts);
+                _logger.Info($"Writing debounced updates to shortcuts.vdf for {updatedGames.Count} game(s).");
+                _importExportService.WriteShortcutsWithBackup(vdfPath!, shortcuts, sourceFingerprint);
             }
         }
         catch (Exception ex)
         {
             _logger.Error(ex, "Failed to process pending game updates to shortcuts.vdf");
+            Requeue(updatedGames, 5000);
+        }
+    }
+
+    private void Requeue(IEnumerable<Game> games, int delayMs)
+    {
+        lock (_updateLock)
+        {
+            foreach (var game in games)
+            {
+                if (game.Id != Guid.Empty) _pendingGames[game.Id] = game;
+            }
+            var retryTimer = new Timer(_ => ProcessPendingGameUpdates(), null, delayMs, Timeout.Infinite);
+            Interlocked.Exchange(ref _updateDebounceTimer, retryTimer)?.Dispose();
         }
     }
 
     private void UpdateShortcutFromGame(Game game, SteamShortcut sc)
     {
         sc.AppName = game.Name;
-        
-        var act = game.GameActions?.FirstOrDefault(a => a.Type == GameActionType.File)
-                  ?? game.GameActions?.FirstOrDefault(a => a.IsPlayAction)
-                  ?? game.GameActions?.FirstOrDefault();
-        if (act != null && act.Type == GameActionType.File)
+
+        var act = GetFileLaunchAction(game);
+        if (act?.Type == GameActionType.File)
         {
             var exe = _pathResolver.ExpandPathVariables(game, act.Path) ?? sc.Exe;
-            var args = _pathResolver.ExpandPathVariables(game, act.Arguments) ?? sc.LaunchOptions;
+            var args = _pathResolver.ExpandArgumentVariables(game, act.Arguments) ?? sc.LaunchOptions;
             var dir = _pathResolver.ExpandPathVariables(game, act.WorkingDir);
             if (string.IsNullOrWhiteSpace(dir))
             {
@@ -173,6 +216,12 @@ internal class WriteBackHandler : IDisposable
 
         
         EnsureSteamPlayAction(game, sc);
+    }
+
+    internal static GameAction? GetFileLaunchAction(Game game)
+    {
+        var action = GameActionSelector.GetPreferredLaunchAction(game.GameActions);
+        return action?.Type == GameActionType.File ? action : null;
     }
 
     private void LogDuplicateGroups(IEnumerable<IGrouping<string, SteamShortcut>> groups, string keyName)

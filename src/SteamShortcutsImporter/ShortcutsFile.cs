@@ -2,6 +2,8 @@ using System;
 using System.Collections.Generic;
 using System.IO;
 using System.Linq;
+using System.Security.Cryptography;
+using System.Globalization;
 
 namespace SteamShortcutsImporter;
 
@@ -19,6 +21,7 @@ public class SteamShortcut
     public int AllowOverlay { get; set; } = 1;
     public int OpenVR { get; set; } = 0;
     public List<string>? Tags { get; set; }
+    internal Dictionary<string, object>? ExtraFields { get; set; }
 
     // A stable id derived from exe + app name similar to Steam's appid seed.
     // Paths are normalized (unquoted) to ensure consistency.
@@ -27,22 +30,55 @@ public class SteamShortcut
 
 public static class ShortcutsFile
 {
+    internal static string GetFileFingerprint(string path)
+    {
+        if (!File.Exists(path)) return string.Empty;
+        using var sha = SHA256.Create();
+        using var stream = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete);
+        return BitConverter.ToString(sha.ComputeHash(stream)).Replace("-", string.Empty);
+    }
+
     public static IEnumerable<SteamShortcut> Read(string path)
     {
         using var fs = File.OpenRead(path);
         var root = BinaryKv.ReadObject(fs);
         var list = new List<SteamShortcut>();
-        if (root.TryGetValue(Constants.ShortcutsKey, out var shortcutsNode) && shortcutsNode is Dictionary<string, object> shortcuts)
+        if (root.Count == 0)
         {
-            foreach (var kv in shortcuts.OrderBy(k => k.Key))
+            return list;
+        }
+
+        if (root.Count != 1
+            || !root.TryGetValue(Constants.ShortcutsKey, out var shortcutsNode)
+            || shortcutsNode is not Dictionary<string, object> shortcuts)
+        {
+            throw new InvalidDataException("shortcuts.vdf has an unexpected root structure.");
+        }
+
+        foreach (var kv in shortcuts.OrderBy(k => k.Key, Comparer<string>.Create(CompareShortcutKeys)))
+        {
+            if (kv.Value is not Dictionary<string, object> sc)
             {
-                if (kv.Value is Dictionary<string, object> sc)
-                {
-                    list.Add(ParseShortcut(sc));
-                }
+                throw new InvalidDataException($"shortcuts.vdf entry '{kv.Key}' has an unexpected value type.");
             }
+
+            list.Add(ParseShortcut(sc));
         }
         return list;
+    }
+
+    private static int CompareShortcutKeys(string left, string right)
+    {
+        var leftIsIndex = uint.TryParse(left, NumberStyles.None, CultureInfo.InvariantCulture, out var leftIndex);
+        var rightIsIndex = uint.TryParse(right, NumberStyles.None, CultureInfo.InvariantCulture, out var rightIndex);
+        if (leftIsIndex && rightIsIndex)
+        {
+            var numericCompare = leftIndex.CompareTo(rightIndex);
+            return numericCompare != 0 ? numericCompare : StringComparer.Ordinal.Compare(left, right);
+        }
+        if (leftIsIndex) return -1;
+        if (rightIsIndex) return 1;
+        return StringComparer.Ordinal.Compare(left, right);
     }
 
     public static void Write(string path, IEnumerable<SteamShortcut> shortcuts)
@@ -68,6 +104,91 @@ public static class ShortcutsFile
         using var fs = File.Open(path, FileMode.Create, FileAccess.Write, FileShare.None);
         BinaryKv.WriteObject(fs, root);
         fs.Flush(true);
+    }
+
+    /// <summary>
+    /// Writes a validated temporary file on the same volume and atomically replaces the target.
+    /// The callback is evaluated after validation and immediately before replacement.
+    /// </summary>
+    internal static void WriteAtomic(string path, IEnumerable<SteamShortcut> shortcuts, Func<bool>? canReplace = null)
+    {
+        if (string.IsNullOrWhiteSpace(path)) throw new ArgumentException("A target path is required.", nameof(path));
+        var expected = shortcuts?.ToList() ?? throw new ArgumentNullException(nameof(shortcuts));
+        var directory = Path.GetDirectoryName(path);
+        if (string.IsNullOrWhiteSpace(directory)) throw new InvalidOperationException("The shortcuts.vdf directory could not be determined.");
+        Directory.CreateDirectory(directory);
+
+        var tempPath = path + "." + Guid.NewGuid().ToString("N") + ".tmp";
+        try
+        {
+            Write(tempPath, expected);
+            var actual = Read(tempPath).ToList();
+            var mismatch = DescribeRoundTripMismatch(expected, actual);
+            if (mismatch != null)
+            {
+                throw new InvalidDataException("The temporary shortcuts.vdf did not match the requested shortcut list: " + mismatch);
+            }
+
+            if (canReplace != null && !canReplace())
+            {
+                throw new OperationCanceledException("The target was no longer safe to replace.");
+            }
+
+            if (File.Exists(path))
+            {
+                File.Replace(tempPath, path, null, true);
+            }
+            else
+            {
+                File.Move(tempPath, path);
+            }
+        }
+        finally
+        {
+            if (File.Exists(tempPath)) File.Delete(tempPath);
+        }
+    }
+
+    private static string? DescribeRoundTripMismatch(IReadOnlyList<SteamShortcut> expected, IReadOnlyList<SteamShortcut> actual)
+    {
+        if (actual.Count != expected.Count) return $"shortcut count expected {expected.Count}, read {actual.Count}";
+
+        for (var index = 0; index < expected.Count; index++)
+        {
+            var wanted = expected[index];
+            var read = actual[index];
+            var title = string.IsNullOrEmpty(wanted.AppName) ? "<unnamed>" : wanted.AppName;
+            string? field = null;
+            string? expectedValue = null;
+            string? actualValue = null;
+
+            if (read.AppId != wanted.AppId) { field = "AppId"; expectedValue = wanted.AppId.ToString(); actualValue = read.AppId.ToString(); }
+            else if (!string.Equals(read.AppName, wanted.AppName, StringComparison.Ordinal)) { field = "AppName"; expectedValue = wanted.AppName; actualValue = read.AppName; }
+            else if (!string.Equals((read.Exe ?? string.Empty).Trim('"'), (wanted.Exe ?? string.Empty).Trim('"'), StringComparison.OrdinalIgnoreCase)) { field = "Exe"; expectedValue = wanted.Exe; actualValue = read.Exe; }
+            else if (!string.Equals(read.StartDir, wanted.StartDir, StringComparison.Ordinal)) { field = "StartDir"; expectedValue = wanted.StartDir; actualValue = read.StartDir; }
+            else if (!string.Equals(read.LaunchOptions, wanted.LaunchOptions, StringComparison.Ordinal)) { field = "LaunchOptions"; expectedValue = wanted.LaunchOptions; actualValue = read.LaunchOptions; }
+            else if (!string.Equals(read.Icon, wanted.Icon, StringComparison.Ordinal)) { field = "Icon"; expectedValue = wanted.Icon; actualValue = read.Icon; }
+            else if (!(read.Tags ?? new List<string>()).SequenceEqual(wanted.Tags ?? new List<string>(), StringComparer.Ordinal))
+            {
+                field = "Tags";
+                expectedValue = string.Join(" | ", wanted.Tags ?? new List<string>());
+                actualValue = string.Join(" | ", read.Tags ?? new List<string>());
+            }
+
+            if (field != null)
+            {
+                return $"shortcut #{index} '{title}', field {field}: expected {FormatDiagnosticValue(expectedValue)}, read {FormatDiagnosticValue(actualValue)}";
+            }
+        }
+
+        return null;
+    }
+
+    private static string FormatDiagnosticValue(string? value)
+    {
+        if (value == null) return "<null>";
+        var normalized = value.Replace("\\", "\\\\").Replace("\r", "\\r").Replace("\n", "\\n").Replace("\t", "\\t");
+        return "\"" + (normalized.Length > 240 ? normalized.Substring(0, 240) + "…" : normalized) + "\"";
     }
 
     private static SteamShortcut ParseShortcut(Dictionary<string, object> obj)
@@ -137,6 +258,7 @@ public static class ShortcutsFile
             AllowDesktopConfig = GetInt(Constants.AllowDesktopConfigKey),
             AllowOverlay = GetInt(Constants.AllowOverlayKey),
             OpenVR = GetInt(Constants.OpenVRKey),
+            ExtraFields = new Dictionary<string, object>(obj, System.StringComparer.Ordinal)
         };
 
         var tagsObj = obj.FirstOrDefault(kv => string.Equals(kv.Key, Constants.TagsKey, System.StringComparison.OrdinalIgnoreCase)).Value;
@@ -160,7 +282,23 @@ public static class ShortcutsFile
                 exeOut = "\"" + exeOut + "\"";
             }
         }
-        var dict = new Dictionary<string, object>
+        var dict = sc.ExtraFields == null
+            ? new Dictionary<string, object>(System.StringComparer.Ordinal)
+            : new Dictionary<string, object>(sc.ExtraFields, System.StringComparer.Ordinal);
+        var knownKeys = new[]
+        {
+            Constants.AppNameKey, Constants.ExeKey, Constants.StartDirKey, Constants.IconKey,
+            Constants.ShortcutPathKey, Constants.LaunchOptionsKey, Constants.AppIdKey,
+            Constants.IsHiddenKey, Constants.AllowDesktopConfigKey, Constants.AllowOverlayKey,
+            Constants.OpenVRKey, Constants.TagsKey,
+            "AppName", "Exe", "StartDir", "Icon", "ShortcutPath", "LaunchOptions", "AppId"
+        };
+        foreach (var key in dict.Keys.Where(key => knownKeys.Any(known => string.Equals(key, known, System.StringComparison.OrdinalIgnoreCase))).ToList())
+        {
+            dict.Remove(key);
+        }
+
+        var known = new Dictionary<string, object>
         {
             [Constants.AppNameKey] = sc.AppName ?? string.Empty,
             [Constants.ExeKey] = exeOut,
@@ -174,6 +312,8 @@ public static class ShortcutsFile
             [Constants.AllowOverlayKey] = sc.AllowOverlay,
             [Constants.OpenVRKey] = sc.OpenVR,
         };
+
+        foreach (var item in known) dict[item.Key] = item.Value;
 
         if (sc.Tags?.Any() == true)
         {
